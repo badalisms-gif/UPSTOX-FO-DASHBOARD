@@ -2,18 +2,32 @@
 import os
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
+
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Upstox F&O Dashboard V3", page_icon="📊", layout="wide")
+st.set_page_config(
+    page_title="Upstox F&O Directional Dashboard",
+    page_icon="📊",
+    layout="wide"
+)
+
 IST = ZoneInfo("Asia/Kolkata")
 BASE = "https://api.upstox.com/v2"
 
+KEYS = {
+    "NIFTY 50": "NSE_INDEX|Nifty 50",
+    "BANK NIFTY": "NSE_INDEX|Nifty Bank",
+    "FIN NIFTY": "NSE_INDEX|Nifty Fin Service"
+}
 
-def num(value, default=None):
+
+def number(value, default=0.0):
     try:
-        return float(value) if value is not None else default
+        if value is None:
+            return default
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -24,68 +38,80 @@ def api_get(path, token, params):
         params=params,
         headers={
             "Authorization": "Bearer " + token,
-            "Accept": "application/json",
+            "Accept": "application/json"
         },
-        timeout=20,
+        timeout=20
     )
+
     if response.status_code != 200:
         raise RuntimeError(
-            f"Upstox HTTP {response.status_code}: {response.text[:250]}"
+            f"Upstox HTTP {response.status_code}: "
+            + response.text[:250]
         )
+
     payload = response.json()
+
     if payload.get("status") != "success":
-        raise RuntimeError(
-            str(payload.get("errors") or payload.get("message") or "API error")
-        )
+        raise RuntimeError(str(
+            payload.get("errors")
+            or payload.get("message")
+            or "Unknown API error"
+        ))
+
     return payload.get("data") or []
 
 
-def unpack(chain):
-    rows = []
+def unpack_chain(chain):
+    records = []
+
     for item in chain:
-        strike = num(item.get("strike_price"), 0)
-        spot = num(item.get("underlying_spot_price"), 0)
+        strike = number(item.get("strike_price"))
+        spot = number(item.get("underlying_spot_price"))
 
         for side, key in [
             ("CE", "call_options"),
-            ("PE", "put_options"),
+            ("PE", "put_options")
         ]:
             option = item.get(key) or {}
-            md = option.get("market_data") or {}
-            gr = option.get("option_greeks") or {}
+            market = option.get("market_data") or {}
+            greeks = option.get("option_greeks") or {}
 
-            bid = num(md.get("bid_price"), 0)
-            ask = num(md.get("ask_price"), 0)
-            oi = num(md.get("oi"), 0)
-            prev_oi = num(md.get("prev_oi"), 0)
+            bid = number(market.get("bid_price"))
+            ask = number(market.get("ask_price"))
+            oi = number(market.get("oi"))
+            prev_oi = number(market.get("prev_oi"))
 
-            rows.append({
+            spread = None
+
+            if ask >= bid > 0:
+                spread = (
+                    (ask - bid) / ((ask + bid) / 2)
+                ) * 100
+
+            records.append({
                 "strike": strike,
-                "spot": spot,
                 "side": side,
-                "instrument": option.get("instrument_key") or "",
-                "ltp": num(md.get("ltp"), 0),
+                "spot": spot,
+                "ltp": number(market.get("ltp")),
                 "oi": oi,
                 "prev_oi": prev_oi,
-                "oi_change_close": oi - prev_oi,
-                "volume": num(md.get("volume"), 0),
+                "oi_change_day": oi - prev_oi,
+                "volume": number(market.get("volume")),
                 "bid": bid,
                 "ask": ask,
-                "spread_pct": (
-                    100 * (ask - bid) / ((ask + bid) / 2)
-                    if ask >= bid > 0 else None
-                ),
-                "iv": num(gr.get("iv")),
-                "delta": num(gr.get("delta")),
-                "gamma": num(gr.get("gamma")),
-                "theta": num(gr.get("theta")),
-                "vega": num(gr.get("vega")),
+                "spread_pct": spread,
+                "iv": number(greeks.get("iv"), None),
+                "delta": number(greeks.get("delta"), None),
+                "gamma": number(greeks.get("gamma"), None),
+                "theta": number(greeks.get("theta"), None),
+                "vega": number(greeks.get("vega"), None),
+                "instrument": option.get("instrument_key", "")
             })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(records)
 
 
-def market_open(now):
+def market_is_open(now):
     return (
         now.weekday() < 5
         and time(9, 15) <= now.time() <= time(15, 30)
@@ -93,493 +119,586 @@ def market_open(now):
 
 
 def analyze_side(
-    df, side, previous, max_spread, max_iv,
-    min_vol, min_score, steps, spot_threshold,
-    rr, in_hours, comparable
+    df, side, previous, spot_change,
+    max_spread, max_iv, min_volume, rr
 ):
-    spot = float(df.spot.iloc[0])
-    strikes = sorted(df.strike.unique())
-    step = min(
-        (b - a for a, b in zip(strikes, strikes[1:]) if b > a),
-        default=50,
-    )
+    if df.empty:
+        return []
 
-    subset = df[
-        (df.side == side)
-        & (abs(df.strike - spot) <= steps * step)
+    spot = number(df["spot"].iloc[0])
+
+    strikes = sorted(df["strike"].unique())
+
+    gaps = [
+        b - a
+        for a, b in zip(strikes[:-1], strikes[1:])
+        if b > a
     ]
 
-    prior_spot = previous.get("spot") if comparable else None
-    prior_rows = previous.get("rows", {}) if comparable else {}
-    spot_move = spot - prior_spot if prior_spot is not None else None
+    step = min(gaps) if gaps else 50
+
+    candidates = df[
+        (df["side"] == side)
+        & (abs(df["strike"] - spot) <= step * 3)
+        & (df["ltp"] > 0)
+        & (df["ask"] > 0)
+    ].copy()
 
     opposite = "PE" if side == "CE" else "CE"
-    wall = df[df.side == opposite]
+
+    opposite_df = df[df["side"] == opposite]
 
     if side == "CE":
-        wall = wall[wall.strike <= spot]
+        wall = opposite_df[
+            (opposite_df["strike"] <= spot)
+            & (opposite_df["strike"] >= spot - step * 2)
+        ]
     else:
-        wall = wall[wall.strike >= spot]
+        wall = opposite_df[
+            (opposite_df["strike"] >= spot)
+            & (opposite_df["strike"] <= spot + step * 2)
+        ]
 
-    wall = wall[abs(wall.strike - spot) <= 2 * step]
-    wall_change = float(wall.oi_change_close.sum()) if not wall.empty else 0
+    wall_change = wall["oi_change_day"].sum()
 
     results = []
 
-    for _, r in subset.iterrows():
-        old = prior_rows.get(r.instrument) if r.instrument else None
-        paired = old is not None and spot_move is not None
+    for _, row in candidates.iterrows():
 
-        premium_move = r.ltp - old["ltp"] if paired else None
-        oi_move = r.oi - old["oi"] if paired else None
-        vol_move = r.volume - old["volume"] if paired else None
+        reasons = []
+        failures = []
 
+        previous_row = previous.get(row["instrument"])
+
+        premium_change = None
+        live_oi_change = None
+
+        if previous_row is not None:
+            premium_change = (
+                row["ltp"] - previous_row["ltp"]
+            )
+            live_oi_change = (
+                row["oi"] - previous_row["oi"]
+            )
+
+        # Seven screening checks.
         checks = [
             (
-                "Spot direction",
-                spot_move is not None and (
-                    spot_move >= spot_threshold
-                    if side == "CE"
-                    else spot_move <= -spot_threshold
-                ),
-            ),
-            (
-                "Premium rising",
-                premium_move is not None and premium_move > 0,
-            ),
-            (
-                "OI rising",
-                oi_move is not None and oi_move > 0,
-            ),
-            (
-                "New traded volume",
-                vol_move is not None and vol_move > 0,
-            ),
-            (
-                "Opposite-side OI buildup vs previous close",
                 wall_change > 0,
+                "Supporting opposite-side OI buildup"
             ),
             (
-                "Delta 0.35 to 0.75",
-                r.delta is not None
-                and 0.35 <= abs(r.delta) <= 0.75,
+                row["oi_change_day"] > 0,
+                "Selected contract OI above previous close"
             ),
             (
-                "IV below ceiling",
-                r.iv is not None and 0 < r.iv <= max_iv,
+                row["volume"] >= min_volume,
+                "Volume threshold passed"
             ),
+            (
+                row["spread_pct"] is not None
+                and 0 <= row["spread_pct"] <= max_spread,
+                "Bid/ask spread acceptable"
+            ),
+            (
+                row["delta"] is not None
+                and 0.35 <= abs(row["delta"]) <= 0.75,
+                "Delta in preferred range"
+            ),
+            (
+                row["iv"] is not None
+                and 0 < row["iv"] <= max_iv,
+                "IV within limit"
+            ),
+            (
+                premium_change is not None
+                and premium_change > 0,
+                "Premium rising since previous snapshot"
+            )
         ]
 
-        score = sum(bool(passed) for _, passed in checks)
+        for passed, description in checks:
+            if passed:
+                reasons.append(description)
+            else:
+                failures.append(description)
 
-        liquid = (
-            r.ltp > 0
-            and r.volume >= min_vol
-            and r.spread_pct is not None
-            and 0 <= r.spread_pct <= max_spread
-            and r.ask > 0
-            and r.bid > 0
+        score = len(reasons)
+
+        entry = row["ask"]
+
+        risk = max(entry * 0.12, 1.0)
+
+        sl = max(0.05, entry - risk)
+        target = entry + risk * rr
+
+        direction_ok = (
+            spot_change is not None
+            and (
+                (side == "CE" and spot_change > 0)
+                or
+                (side == "PE" and spot_change < 0)
+            )
         )
 
-        ready = bool(
-            in_hours
-            and paired
-            and liquid
-            and all(ok for _, ok in checks[:4])
-            and score >= min_score
+        # Require actual intraday OI increase
+        # as an additional hard confirmation.
+        oi_live_ok = (
+            live_oi_change is not None
+            and live_oi_change > 0
         )
-
-        entry = r.ask if r.ask > 0 else None
-        risk = max(entry * 0.12, 1.0) if entry is not None else None
 
         results.append({
-            "row": r,
+            "strike": row["strike"],
+            "side": side,
+            "ltp": row["ltp"],
             "score": score,
-            "checks": checks,
-            "ready": ready,
-            "liquid": liquid,
-            "spot_move": spot_move,
-            "premium_move": premium_move,
-            "oi_move": oi_move,
-            "vol_move": vol_move,
+            "delta": row["delta"],
+            "iv": row["iv"],
+            "spread": row["spread_pct"],
+            "oi": row["oi"],
+            "oi_change_day": row["oi_change_day"],
+            "premium_change": premium_change,
+            "live_oi_change": live_oi_change,
+            "spot_change": spot_change,
+            "direction_ok": direction_ok,
+            "oi_live_ok": oi_live_ok,
             "entry": entry,
-            "sl": max(0.05, entry - risk) if entry is not None else None,
-            "target": entry + risk * rr if entry is not None else None,
-            "distance": abs(r.strike - spot),
+            "sl": sl,
+            "target": target,
+            "reasons": reasons,
+            "failures": failures,
+            "distance": abs(row["strike"] - spot)
         })
 
-    return sorted(
-        results,
+    results.sort(
         key=lambda x: (
-            x["ready"],
             x["score"],
-            -x["distance"],
+            -x["distance"]
         ),
-        reverse=True,
+        reverse=True
     )
 
-
-def display_change(value):
-    return f"{value:+,.2f}" if value is not None else "N/A"
+    return results[:3]
 
 
-st.title("Upstox F&O | Option Chain + Greeks Dashboard V3")
+def fmt_change(value):
+    if value is None:
+        return "N/A"
+    return f"{value:+,.2f}"
+
+
+def display_candidates(title, items):
+    st.subheader(title)
+
+    if not items:
+        st.warning("No eligible contracts")
+        return
+
+    rows = []
+
+    for item in items:
+        rows.append({
+            "Strike": f'{item["strike"]:g} {item["side"]}',
+            "Score": f'{item["score"]}/7',
+            "LTP": round(item["ltp"], 2),
+            "Delta": item["delta"],
+            "IV": item["iv"],
+            "Spread %": item["spread"],
+            "Entry*": round(item["entry"], 2),
+            "SL*": round(item["sl"], 2),
+            "Target*": round(item["target"], 2)
+        })
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    best = items[0]
+
+    st.write(
+        f'**Best candidate:** '
+        f'{best["strike"]:g} {best["side"]} '
+        f'| Score {best["score"]}/7'
+    )
+
+    st.write(
+        f'Spot change: {fmt_change(best["spot_change"])} '
+        f'| Premium change: '
+        f'{fmt_change(best["premium_change"])} '
+        f'| Live OI change: '
+        f'{fmt_change(best["live_oi_change"])}'
+    )
+
+    with st.expander("Why this score?"):
+        for reason in best["reasons"]:
+            st.success(reason)
+
+        for failure in best["failures"]:
+            st.warning(failure)
+
+
+st.title("Upstox F&O | Directional Signal Dashboard")
+
 st.caption(
-    "Top 3 CE and PE candidates | Research-only | No automatic orders"
+    "One final direction | CE / PE / NO TRADE | "
+    "Research only | No automatic orders"
 )
 
 with st.sidebar:
+
     st.header("Connection")
 
     token = st.text_input(
         "Upstox Algo Trading Access Token",
         value=os.environ.get("UPSTOX_ACCESS_TOKEN", ""),
-        type="password",
+        type="password"
     )
 
     underlying = st.selectbox(
         "Underlying",
-        ["NIFTY 50", "BANK NIFTY", "FIN NIFTY"],
+        list(KEYS.keys())
     )
 
-    keys = {
-        "NIFTY 50": "NSE_INDEX|Nifty 50",
-        "BANK NIFTY": "NSE_INDEX|Nifty Bank",
-        "FIN NIFTY": "NSE_INDEX|Nifty Fin Service",
-    }
-
-    instrument_key = keys[underlying]
+    instrument_key = KEYS[underlying]
 
     expiry = st.text_input(
         "Expiry (YYYY-MM-DD)",
-        "2026-11-23",
-    ).strip()
+        value="2026-11-23"
+    )
 
     st.header("Signal filters")
 
     max_spread = st.slider(
         "Maximum bid/ask spread %",
-        0.5, 10.0, 3.0, 0.5,
+        0.5, 10.0, 3.0, 0.5
     )
 
     max_iv = st.slider(
         "Maximum IV (%)",
-        10, 100, 40,
+        10, 100, 40
     )
 
-    min_vol = st.number_input(
-        "Minimum cumulative traded volume",
+    min_volume = st.number_input(
+        "Minimum traded volume",
         min_value=0,
         value=10000,
-        step=1000,
+        step=1000
     )
 
     min_score = st.slider(
-        "Minimum BUY score (out of 7)",
-        4, 7, 6,
-    )
-
-    steps = st.slider(
-        "Strikes to scan on each side of ATM",
-        1, 10, 3,
-    )
-
-    spot_threshold = st.number_input(
-        "Minimum spot movement between snapshots (points)",
-        min_value=0.0,
-        value=2.0,
-        step=0.5,
+        "Minimum BUY score",
+        4, 7, 6
     )
 
     rr = st.slider(
-        "Illustrative reward/risk",
-        1.0, 3.0, 1.5, 0.25,
+        "Reward / Risk",
+        1.0, 3.0, 1.75, 0.25
     )
 
     auto = st.toggle(
         "Auto-refresh every 30 seconds",
-        value=False,
+        value=True
     )
 
     st.caption(
-        "Keep this page open for refreshes. Respect API limits."
+        "Access token is used for your API requests. "
+        "Do not share it publicly."
     )
 
 
 if "previous" not in st.session_state:
-    st.session_state.previous = None
+    st.session_state.previous = {}
 
-if "identity" not in st.session_state:
-    st.session_state.identity = ""
+if "previous_spot" not in st.session_state:
+    st.session_state.previous_spot = None
+
+if "previous_time" not in st.session_state:
+    st.session_state.previous_time = None
+
+if "last_identity" not in st.session_state:
+    st.session_state.last_identity = None
+
+if "force_refresh" not in st.session_state:
+    st.session_state.force_refresh = False
 
 
 @st.fragment(run_every="30s" if auto else None)
 def dashboard():
-    manual = st.button(
-        "Fetch / Refresh Now",
-        type="primary",
-    )
+
+    if st.button("Fetch / Refresh Now", type="primary"):
+        st.session_state.force_refresh = True
 
     if not token:
-        st.info("Enter your Upstox Access Token in the sidebar.")
+        st.info("Enter Upstox Access Token in sidebar.")
         return
+
+    identity = instrument_key + ":" + expiry.strip()
+
+    if identity != st.session_state.last_identity:
+        st.session_state.previous = {}
+        st.session_state.previous_spot = None
+        st.session_state.previous_time = None
+        st.session_state.last_identity = identity
+
+    if not auto and not st.session_state.force_refresh:
+        st.info("Click Fetch / Refresh Now.")
+        return
+
+    st.session_state.force_refresh = False
 
     try:
-        datetime.strptime(expiry, "%Y-%m-%d")
-    except ValueError:
-        st.error("Enter a listed expiry in YYYY-MM-DD format.")
-        return
-
-    identity = f"{instrument_key}|{expiry}"
-
-    if identity != st.session_state.identity:
-        st.session_state.identity = identity
-        st.session_state.previous = None
-
-    if not (manual or auto):
-        st.info("Click Fetch / Refresh Now or enable auto-refresh.")
-        return
-
-    try:
-        df = unpack(
-            api_get(
-                "/option/chain",
-                token,
-                {
-                    "instrument_key": instrument_key,
-                    "expiry_date": expiry,
-                },
-            )
+        raw = api_get(
+            "/option/chain",
+            token,
+            {
+                "instrument_key": instrument_key,
+                "expiry_date": expiry.strip()
+            }
         )
-    except (requests.RequestException, RuntimeError, ValueError) as exc:
-        st.error(f"Upstox API error: {exc}")
+
+        df = unpack_chain(raw)
+
+    except Exception as exc:
+        st.error(f"API fetch failed: {exc}")
         return
 
     if df.empty:
         st.warning(
-            "No option-chain data. Check expiry and contract availability."
+            "No option-chain data returned. "
+            "Check expiry and contract availability."
         )
         return
 
     now = datetime.now(IST)
-    in_hours = market_open(now)
-    spot = float(df.spot.iloc[0])
+    open_hours = market_is_open(now)
 
-    ce_oi = df[df.side == "CE"].oi.sum()
-    pe_oi = df[df.side == "PE"].oi.sum()
-    pcr = pe_oi / ce_oi if ce_oi else None
+    spot = number(df["spot"].iloc[0])
 
-    previous = st.session_state.previous
+    ce_oi = df[df["side"] == "CE"]["oi"].sum()
+    pe_oi = df[df["side"] == "PE"]["oi"].sum()
 
-    comparable = bool(
-        previous
-        and previous.get("time")
-        and in_hours
-        and previous["time"].date() == now.date()
-        and 0 < (now - previous["time"]).total_seconds() <= 120
-    )
+    pcr = pe_oi / ce_oi if ce_oi > 0 else 0
 
     st.caption(
-        f"Last fetch: {now:%d %b %Y %I:%M:%S %p} IST"
+        f'Last fetch: {now:%d %b %Y %I:%M:%S %p} IST'
     )
 
-    if not in_hours:
+    if not open_hours:
         st.warning(
-            "Outside normal trading hours. BUY disabled; quotes may be stale."
+            "Outside normal trading hours. "
+            "BUY disabled; quotes may be stale."
         )
 
-    if not comparable:
-        st.info(
-            "Waiting for two recent market-hours snapshots to compare changes."
-        )
+    # Only compare recent snapshots.
+    previous = st.session_state.previous
+    previous_spot = st.session_state.previous_spot
+    previous_time = st.session_state.previous_time
+
+    fresh_comparison = False
+
+    if (
+        open_hours
+        and previous_time is not None
+        and previous_spot is not None
+    ):
+        elapsed = (now - previous_time).total_seconds()
+
+        fresh_comparison = 25 <= elapsed <= 90
+
+    if fresh_comparison:
+        spot_change = spot - previous_spot
+    else:
+        spot_change = None
+        previous = {}
 
     a, b, c, d = st.columns(4)
 
-    a.metric("Underlying spot", f"{spot:,.2f}")
-    b.metric(
-        "Put/Call OI ratio",
-        f"{pcr:.2f}" if pcr is not None else "N/A",
-    )
-    c.metric("CE OI (all strikes)", f"{ce_oi:,.0f}")
-    d.metric("PE OI (all strikes)", f"{pe_oi:,.0f}")
+    a.metric("NIFTY / Index Spot", f"{spot:,.2f}")
+    b.metric("Put/Call OI Ratio", f"{pcr:.2f}")
+    c.metric("CE Total OI", f"{ce_oi:,.0f}")
+    d.metric("PE Total OI", f"{pe_oi:,.0f}")
 
-    ce = analyze_side(
-        df, "CE", previous, max_spread, max_iv,
-        min_vol, min_score, steps, spot_threshold,
-        rr, in_hours, comparable,
+    ce_items = analyze_side(
+        df, "CE", previous, spot_change,
+        max_spread, max_iv, min_volume, rr
     )
 
-    pe = analyze_side(
-        df, "PE", previous, max_spread, max_iv,
-        min_vol, min_score, steps, spot_threshold,
-        rr, in_hours, comparable,
+    pe_items = analyze_side(
+        df, "PE", previous, spot_change,
+        max_spread, max_iv, min_volume, rr
     )
 
-    conflict = bool(
-        ce and pe and ce[0]["ready"] and pe[0]["ready"]
-    )
+    # Use the best eligible candidate from each side,
+    # not just the highest-ranked row.
+    def eligible(items):
+        return [
+            item for item in items
+            if item["score"] >= min_score
+            and item["direction_ok"]
+            and item["oi_live_ok"]
+            and item["premium_change"] is not None
+            and item["premium_change"] > 0
+        ]
 
-    if conflict:
-        st.warning(
-            "Conflicting CE and PE confirmations: BUY blocked for both sides."
+    ce_eligible = eligible(ce_items)
+    pe_eligible = eligible(pe_items)
+
+    ce_best = ce_eligible[0] if ce_eligible else None
+    pe_best = pe_eligible[0] if pe_eligible else None
+
+    st.divider()
+    st.subheader("FINAL TRADING DECISION")
+
+    final_signal = "NO TRADE"
+    selected = None
+
+    if not open_hours:
+        reason = "Market is closed."
+
+    elif not fresh_comparison:
+        reason = (
+            "Waiting for two recent market-hours "
+            "snapshots approximately 30 seconds apart."
         )
 
-    st.subheader("Top 3 CE / PE candidates")
+    elif spot_change == 0:
+        reason = "No observed spot movement."
+
+    elif ce_best and pe_best:
+        reason = "Both sides qualified; conflicting signals."
+
+    elif ce_best:
+        final_signal = "CALL BUY CANDIDATE"
+        selected = ce_best
+        reason = "Spot and CE premium rising with OI confirmation."
+
+    elif pe_best:
+        final_signal = "PUT BUY CANDIDATE"
+        selected = pe_best
+        reason = "Spot falling and PE premium rising with OI confirmation."
+
+    else:
+        reason = "Directional confirmation insufficient."
+
+    if selected:
+        st.success(final_signal)
+
+        st.metric(
+            "Selected Contract",
+            f'{selected["strike"]:g} {selected["side"]}'
+        )
+
+        st.metric(
+            "Confirmation Score",
+            f'{selected["score"]}/7'
+        )
+
+        x, y, z = st.columns(3)
+
+        x.metric(
+            "Indicative Entry",
+            f'₹{selected["entry"]:.2f}'
+        )
+
+        y.metric(
+            "Illustrative SL",
+            f'₹{selected["sl"]:.2f}'
+        )
+
+        z.metric(
+            "Illustrative Target",
+            f'₹{selected["target"]:.2f}'
+        )
+
+    else:
+        st.info("NO TRADE")
+
+    st.write("**Reason:**", reason)
+
+    st.caption(
+        "These are candidate signals, not validated "
+        "trade recommendations. Entry/SL/Target are "
+        "illustrative and not based on backtesting."
+    )
+
+    st.divider()
+    st.subheader("Top 3 CE / PE Candidates")
 
     left, right = st.columns(2)
 
-    for col, side, candidates in [
-        (left, "CALL (CE)", ce),
-        (right, "PUT (PE)", pe),
-    ]:
-        with col:
-            st.markdown(f"### {side}")
+    with left:
+        display_candidates("CALL (CE)", ce_items)
 
-            if not candidates:
-                st.warning(
-                    "No candidates in selected strike range."
-                )
-                continue
-
-            rows = []
-
-            for rank, item in enumerate(candidates[:3], 1):
-                r = item["row"]
-
-                status = (
-                    "BUY CANDIDATE"
-                    if item["ready"] and not conflict
-                    else "WAIT"
-                )
-
-                rows.append({
-                    "Rank": rank,
-                    "Strike": f"{r.strike:g} {r.side}",
-                    "Status": status,
-                    "Score": f"{item['score']}/7",
-                    "LTP": round(r.ltp, 2),
-                    "OI change (refresh)": item["oi_move"],
-                    "Premium change": item["premium_move"],
-                    "Delta": r.delta,
-                    "IV %": r.iv,
-                    "Spread %": (
-                        round(r.spread_pct, 2)
-                        if r.spread_pct is not None
-                        else None
-                    ),
-                    "Entry*": (
-                        round(item["entry"], 2)
-                        if item["entry"] is not None
-                        else None
-                    ),
-                    "SL*": (
-                        round(item["sl"], 2)
-                        if item["sl"] is not None
-                        else None
-                    ),
-                    "Target*": (
-                        round(item["target"], 2)
-                        if item["target"] is not None
-                        else None
-                    ),
-                })
-
-            st.dataframe(
-                pd.DataFrame(rows),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            best = candidates[0]
-            r = best["row"]
-
-            status = (
-                "BUY CANDIDATE"
-                if best["ready"] and not conflict
-                else "WAIT"
-            )
-
-            st.write(
-                f"**Best candidate:** {r.strike:g} {r.side} | "
-                f"Score {best['score']}/7 | {status}"
-            )
-
-            st.write(
-                "Spot change: "
-                + display_change(best["spot_move"])
-                + " | Premium change: "
-                + display_change(best["premium_move"])
-                + " | OI change: "
-                + display_change(best["oi_move"])
-            )
-
-            with st.expander("Why this score?"):
-                for label, ok in best["checks"]:
-                    st.write(
-                        ("✅ " if ok else "❌ ") + label
-                    )
-
-                st.write(
-                    "Liquidity gate: "
-                    + ("PASS" if best["liquid"] else "FAIL")
-                )
+    with right:
+        display_candidates("PUT (PE)", pe_items)
 
     st.caption(
-        "* Entry is indicative ask; SL uses 12% premium risk "
-        "and target uses selected reward/risk. "
-        "These values are illustrative even for WAIT rows."
+        "Entry is indicative ask. SL uses 12% "
+        "premium risk and target uses selected R:R."
     )
 
-    st.warning(
-        "Snapshot-based heuristic only; not a backtested "
-        "trading system. OI increases cannot distinguish "
-        "buying from writing on their own. Previous-close "
-        "OI buildup is not live directional confirmation."
-    )
+    st.divider()
+    st.subheader("Full Option Chain + Greeks")
 
-    st.subheader("Full option chain and Greeks")
-
-    cols = [
+    columns = [
         "strike", "side", "ltp", "oi", "prev_oi",
-        "oi_change_close", "volume", "bid", "ask",
-        "spread_pct", "iv", "delta", "gamma",
-        "theta", "vega",
+        "oi_change_day", "volume", "bid", "ask",
+        "spread_pct", "iv", "delta",
+        "gamma", "theta", "vega"
     ]
 
-    view = df[cols].sort_values(["strike", "side"])
+    view = df[columns].sort_values(
+        ["strike", "side"]
+    )
 
     st.dataframe(
         view,
         use_container_width=True,
         hide_index=True,
-        height=430,
+        height=450
     )
 
     st.download_button(
-        "Download option chain CSV",
+        "Download Option Chain CSV",
         view.to_csv(index=False),
         file_name="upstox_option_chain.csv",
-        mime="text/csv",
+        mime="text/csv"
     )
 
-    st.session_state.previous = {
-        "time": now,
-        "spot": spot,
-        "rows": {
-            r.instrument: {
-                "ltp": r.ltp,
-                "oi": r.oi,
-                "volume": r.volume,
+    st.warning(
+        "Research-only heuristic. OI increase alone "
+        "does not prove buying or writing. "
+        "This dashboard does not check exchange holidays "
+        "or confirm the trend using 5-minute candles."
+    )
+
+    # Save current snapshot for the next refresh.
+    if open_hours:
+        st.session_state.previous = {
+            row["instrument"]: {
+                "ltp": row["ltp"],
+                "oi": row["oi"]
             }
-            for _, r in df.iterrows()
-            if r.instrument and r.ltp > 0
-        },
-    }
+            for _, row in df.iterrows()
+            if row["instrument"] and row["ltp"] > 0
+        }
+
+        st.session_state.previous_spot = spot
+        st.session_state.previous_time = now
+
+    else:
+        st.session_state.previous = {}
+        st.session_state.previous_spot = None
+        st.session_state.previous_time = None
 
 
 dashboard()
 
 st.caption(
-    "Source: Upstox Option Chain API v2 | "
-    "No automatic order placement."
+    "Source: Upstox Option Chain API v2. "
+    "Independent research dashboard. "
+    "No automatic broker orders."
 )
