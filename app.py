@@ -1,987 +1,339 @@
 
 import os
-from datetime import datetime, date, time, timedelta
+import gzip
+import json
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
-
+from urllib.parse import quote
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(
-    page_title="NIFTY F&O | Chain + Market Trend",
-    page_icon="📊",
-    layout="wide"
-)
-
-IST = ZoneInfo("Asia/Kolkata")
-BASE = "https://api.upstox.com"
-SESSION = requests.Session()
-
-INDEX_KEYS = {
-    "NIFTY 50": "NSE_INDEX|Nifty 50",
-    "BANK NIFTY": "NSE_INDEX|Nifty Bank",
-    "FIN NIFTY": "NSE_INDEX|Nifty Fin Service"
-}
+st.set_page_config(page_title='NSE Options | Chain & Trend', page_icon='📊', layout='wide')
+IST = ZoneInfo('Asia/Kolkata')
+API = 'https://api.upstox.com'
+MASTER = 'https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz'
+INDEXES = {'NIFTY 50':'NSE_INDEX|Nifty 50','BANK NIFTY':'NSE_INDEX|Nifty Bank','FIN NIFTY':'NSE_INDEX|Nifty Fin Service'}
 
 
-def number(value, default=0.0):
+def n(v, default=np.nan):
     try:
-        result = float(value)
-        return result if np.isfinite(result) else default
-    except (ValueError, TypeError):
+        x = float(v)
+        return x if np.isfinite(x) else default
+    except (TypeError, ValueError):
         return default
 
 
-def api_get(path, token, params=None):
-    response = SESSION.get(
-        BASE + path,
-        params=params,
-        headers={
-            "Authorization": "Bearer " + token,
-            "Accept": "application/json"
-        },
-        timeout=25
-    )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Upstox HTTP {response.status_code}: "
-            f"{response.text[:250]}"
-        )
-
-    payload = response.json()
-
-    if payload.get("status") != "success":
-        raise RuntimeError(str(payload.get("errors", "API error")))
-
-    return payload.get("data") or {}
+def request_data(path, token, params=None):
+    r = requests.get(API + path, params=params, headers={'Authorization':f'Bearer {token}', 'Accept':'application/json'}, timeout=25)
+    if not r.ok:
+        raise RuntimeError(f'Upstox HTTP {r.status_code}: {r.text[:220]}')
+    data = r.json()
+    if data.get('status') != 'success':
+        raise RuntimeError(str(data.get('errors') or data.get('message') or 'API error'))
+    return data.get('data') or {}
 
 
-def get_expiry(token, key, requested):
-    requested = requested.strip()
-
-    if requested != "current_week":
-        return requested
-
-    data = api_get(
-        "/v2/option/contract",
-        token,
-        {"instrument_key": key}
-    )
-
-    today = datetime.now(IST).date()
-
-    dates = sorted({
-        item.get("expiry")
-        for item in data
-        if item.get("expiry")
-        and date.fromisoformat(item["expiry"]) >= today
-    })
-
-    if not dates:
-        raise RuntimeError("No upcoming option expiry found.")
-
-    return dates[0]
-
-
-def get_chain(token, key, expiry):
-    data = api_get(
-        "/v2/option/chain",
-        token,
-        {
-            "instrument_key": key,
-            "expiry_date": expiry
-        }
-    )
-
-    records = []
-
-    for item in data:
-        strike = number(item.get("strike_price"))
-        spot = number(item.get("underlying_spot_price"))
-
-        for side, field in [
-            ("CE", "call_options"),
-            ("PE", "put_options")
-        ]:
-            option = item.get(field) or {}
-            market = option.get("market_data") or {}
-            greeks = option.get("option_greeks") or {}
-
-            bid = number(market.get("bid_price"))
-            ask = number(market.get("ask_price"))
-            ltp = number(market.get("ltp"))
-            oi = number(market.get("oi"))
-            previous_oi = number(market.get("prev_oi"))
-
-            spread = (
-                (ask - bid) / ((ask + bid) / 2) * 100
-                if ask >= bid > 0 else None
-            )
-
-            records.append({
-                "strike": strike,
-                "side": side,
-                "spot": spot,
-                "ltp": ltp,
-                "oi": oi,
-                "prev_oi": previous_oi,
-                "oi_change": oi - previous_oi,
-                "volume": number(market.get("volume")),
-                "bid": bid,
-                "ask": ask,
-                "spread_pct": spread,
-                "iv": number(greeks.get("iv"), None),
-                "delta": number(greeks.get("delta"), None),
-                "gamma": number(greeks.get("gamma"), None),
-                "theta": number(greeks.get("theta"), None),
-                "vega": number(greeks.get("vega"), None),
-                "instrument": option.get("instrument_key", "")
-            })
-
-    return pd.DataFrame(records)
-
-
-def score_options(df, side, max_spread, max_iv, min_volume,
-                  previous, now):
-    if df.empty:
-        return pd.DataFrame()
-
-    spot = number(df["spot"].iloc[0])
-
-    strikes = sorted(df["strike"].unique())
-    differences = np.diff(strikes)
-    differences = differences[differences > 0]
-    step = float(differences.min()) if len(differences) else 50
-
-    candidates = df[
-        (df.side == side) &
-        ((df.strike - spot).abs() <= step * 3)
-    ].copy()
-
-    opposite = "PE" if side == "CE" else "CE"
-    results = []
-
-    for _, row in candidates.iterrows():
-        reasons = []
-        failures = []
-
-        wall = df[
-            (df.side == opposite) &
-            ((df.strike - spot).abs() <= 2 * step)
-        ]
-
-        if side == "CE":
-            wall = wall[wall.strike <= spot]
-        else:
-            wall = wall[wall.strike >= spot]
-
-        tests = [
-            (
-                wall.oi_change.sum() > 0,
-                "Opposite-side OI buildup"
-            ),
-            (
-                row.oi_change > 0,
-                "Selected contract OI increased"
-            ),
-            (
-                row.volume >= min_volume and row.volume > 0,
-                "Volume sufficient"
-            ),
-            (
-                row.spread_pct is not None
-                and 0 <= row.spread_pct <= max_spread,
-                "Bid/ask spread acceptable"
-            ),
-            (
-                row.delta is not None
-                and 0.35 <= abs(row.delta) <= 0.75,
-                "Delta acceptable"
-            ),
-            (
-                row.iv is not None
-                and 0 < row.iv <= max_iv,
-                "IV acceptable"
-            )
-        ]
-
-        for passed, label in tests:
-            (reasons if passed else failures).append(label)
-
-        old = previous.get(row.instrument)
-
-        fresh = (
-            old is not None
-            and old.get("time") is not None
-            and 0 < (now - old["time"]).total_seconds() <= 180
-        )
-
-        if fresh:
-            if row.ltp > old["ltp"]:
-                reasons.append("Premium rising since previous snapshot")
-            else:
-                failures.append("Premium not rising")
-        else:
-            failures.append("Recent comparison snapshot unavailable")
-
-        score = len(reasons)
-
-        entry = row.ask if row.ask > 0 else row.ltp
-        risk = max(entry * 0.12, 1.0)
-
-        results.append({
-            **row.to_dict(),
-            "score": score,
-            "reasons": reasons,
-            "failures": failures,
-            "entry": entry,
-            "risk": risk,
-            "fresh": fresh
-        })
-
-    if not results:
-        return pd.DataFrame()
-
-    result = pd.DataFrame(results)
-    result["atm_distance"] = (result.strike - spot).abs()
-
-    return result.sort_values(
-        ["score", "atm_distance"],
-        ascending=[False, True]
-    ).head(3)
-
-
-def parse_candles(data):
-    rows = data.get("candles", []) if isinstance(data, dict) else []
-
-    if not rows:
-        return pd.DataFrame()
-
-    records = []
-
-    for candle in rows:
-        try:
-            stamp = pd.to_datetime(candle[0], utc=True).tz_convert(IST)
-            records.append({
-                "timestamp": stamp,
-                "open": float(candle[1]),
-                "high": float(candle[2]),
-                "low": float(candle[3]),
-                "close": float(candle[4]),
-                "volume": float(candle[5]) if len(candle) > 5 else 0
-            })
-        except (ValueError, TypeError, IndexError):
+@st.cache_data(ttl=86400, show_spinner='Loading NSE instrument list...')
+def instruments():
+    r = requests.get(MASTER, timeout=40)
+    r.raise_for_status()
+    items = json.loads(gzip.decompress(r.content))
+    rows = []
+    for x in items:
+        if x.get('segment') != 'NSE_EQ':
             continue
+        key = x.get('instrument_key')
+        symbol = x.get('trading_symbol') or x.get('tradingsymbol')
+        if key and symbol:
+            rows.append({'symbol':str(symbol), 'name':str(x.get('name') or symbol), 'key':key})
+    return pd.DataFrame(rows).drop_duplicates('key').sort_values('symbol')
 
+
+def contracts(token, key):
+    raw = request_data('/v2/option/contract', token, {'instrument_key':key})
+    if not isinstance(raw, list):
+        raise RuntimeError('Unexpected option contract response')
+    today = datetime.now(IST).date()
+    dates = set()
+    for item in raw:
+        d = item.get('expiry')
+        if d:
+            try:
+                if datetime.strptime(d, '%Y-%m-%d').date() >= today:
+                    dates.add(d)
+            except ValueError:
+                pass
+    return sorted(dates)
+
+
+def option_chain(token, key, expiry):
+    raw = request_data('/v2/option/chain', token, {'instrument_key':key, 'expiry_date':expiry})
+    rows = []
+    for x in raw:
+        for side, field in [('CE','call_options'),('PE','put_options')]:
+            o = x.get(field) or {}
+            m, g = o.get('market_data') or {}, o.get('option_greeks') or {}
+            bid, ask = n(m.get('bid_price')), n(m.get('ask_price'))
+            spread = 100*(ask-bid)/((ask+bid)/2) if np.isfinite(bid) and np.isfinite(ask) and ask >= bid > 0 else np.nan
+            oi, prev = n(m.get('oi'),0), n(m.get('prev_oi'),0)
+            rows.append({'strike':n(x.get('strike_price')),'side':side,'spot':n(x.get('underlying_spot_price')),
+                'ltp':n(m.get('ltp')),'oi':oi,'prev_oi':prev,'oi_change':oi-prev,
+                'volume':n(m.get('volume'),0),'bid':bid,'ask':ask,'spread_pct':spread,
+                'iv':n(g.get('iv')),'delta':n(g.get('delta')),'gamma':n(g.get('gamma')),
+                'theta':n(g.get('theta')),'vega':n(g.get('vega')),
+                'instrument':o.get('instrument_key') or ''})
+    return pd.DataFrame(rows)
+
+
+def candidate_list(df, side, old, old_time, now, min_vol, max_spread, max_iv, rr):
+    spot = n(df.spot.dropna().iloc[0]) if df.spot.notna().any() else np.nan
+    strikes = sorted(df.strike.dropna().unique())
+    gaps = [b-a for a,b in zip(strikes, strikes[1:]) if b>a]
+    step = min(gaps) if gaps else 50
+    subset = df[(df.side==side) & ((df.strike-spot).abs()<=3*step) & (df.ltp>0)]
+    opp = df[df.side==('PE' if side=='CE' else 'CE')]
+    wall = opp[(opp.strike<=spot) & (opp.strike>=spot-2*step)] if side=='CE' else opp[(opp.strike>=spot) & (opp.strike<=spot+2*step)]
+    fresh = old_time is not None and 15 <= (now-old_time).total_seconds() <= 180
+    out=[]
+    for _,r in subset.iterrows():
+        prev = old.get(r.instrument) if fresh else None
+        premium_up = prev is not None and r.ltp > prev
+        checks = {
+            'Opposite OI change vs previous close':wall.oi_change.sum()>0,
+            'Selected OI change vs previous close':r.oi_change>0,
+            'Volume':r.volume>=min_vol and r.volume>0,
+            'Bid/ask spread':np.isfinite(r.spread_pct) and 0<=r.spread_pct<=max_spread,
+            'Delta':np.isfinite(r.delta) and 0.35<=abs(r.delta)<=0.75,
+            'IV':np.isfinite(r.iv) and 0<r.iv<=max_iv,
+            'Premium up vs recent snapshot':premium_up,
+        }
+        entry = r.ask if np.isfinite(r.ask) and r.ask>0 else r.ltp
+        risk = max(entry*0.12,1.0)
+        out.append({'strike':r.strike,'side':side,'score':sum(checks.values()),'ltp':r.ltp,
+                    'delta':r.delta,'iv':r.iv,'spread':r.spread_pct,'oi':r.oi,'volume':r.volume,
+                    'premium_up':premium_up,'fresh':fresh,'entry':entry,'sl':max(0.05,entry-risk),
+                    'target':entry+risk*rr,'checks':checks,'distance':abs(r.strike-spot)})
+    return sorted(out,key=lambda x:(-x['score'],x['distance']))[:3]
+
+
+def parse_candles(payload):
+    raw = payload.get('candles',[]) if isinstance(payload,dict) else []
+    records=[]
+    for c in raw:
+        try:
+            records.append([pd.to_datetime(c[0],utc=True).tz_convert(IST),*[float(v) for v in c[1:6]]])
+        except (IndexError, ValueError, TypeError):
+            continue
     if not records:
         return pd.DataFrame()
-
-    frame = pd.DataFrame(records)
-
-    return (
-        frame.drop_duplicates("timestamp")
-        .sort_values("timestamp")
-        .set_index("timestamp")
-    )
+    return (pd.DataFrame(records,columns=['timestamp','open','high','low','close','volume'])
+            .drop_duplicates('timestamp').sort_values('timestamp').set_index('timestamp'))
 
 
-def get_intraday_candles(token, key):
-    data = api_get(
-        f"/v2/historical-candle/intraday/{key}/1minute",
-        token
-    )
-    return parse_candles(data)
+def candle_data(token,key,now):
+    encoded=quote(key,safe='')
+    today=now.date()
+    previous=(today-timedelta(days=12)).isoformat()
+    yesterday=(today-timedelta(days=1)).isoformat()
+    # Historical V3 supplies previous sessions to initialize EMA/RSI/ADX.
+    historical = request_data(f'/v3/historical-candle/{encoded}/minutes/1/{yesterday}/{previous}',token)
+    history=parse_candles(historical)
+    # Current-session V2 endpoint may return empty for some symbols/accounts.
+    intraday=request_data(f'/v2/historical-candle/intraday/{encoded}/1minute',token)
+    current=parse_candles(intraday)
+    return history,current
 
 
-def get_history_candles(token, key, today):
-    # Upstox V3 historical endpoint supports 1-minute candles.
-    from_date = (today - timedelta(days=12)).isoformat()
-    to_date = (today - timedelta(days=1)).isoformat()
-
-    data = api_get(
-        f"/v3/historical-candle/{key}/minutes/1/"
-        f"{to_date}/{from_date}",
-        token
-    )
-
-    return parse_candles(data)
-
-
-def five_minute_candles(frame, now):
-    if frame.empty:
-        return pd.DataFrame()
-
-    frame = frame.between_time("09:15", "15:29").copy()
-
-    # Resample each trading day from the 09:15 session anchor.
-    result = frame.resample(
-        "5min",
-        origin="start_day",
-        offset="15min",
-        label="left",
-        closed="left"
-    ).agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
-    })
-
-    result = result.dropna(subset=["open", "close"])
-
-    # Exclude incomplete current 5-minute candle.
-    result = result[
-        result.index + pd.Timedelta(minutes=5) <= pd.Timestamp(now)
-    ]
-
-    return result
-
-
-def calculate_rsi(close, length=9):
-    change = close.diff()
-    gain = change.clip(lower=0)
-    loss = (-change).clip(lower=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - 100 / (1 + rs)
-
-    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
-    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0)
-
-    return rsi
-
-
-def calculate_adx(frame, length=14):
-    high = frame.high
-    low = frame.low
-    close = frame.close
-
-    up = high.diff()
-    down = -low.diff()
-
-    plus_dm = pd.Series(
-        np.where((up > down) & (up > 0), up, 0.0),
-        index=frame.index
-    )
-
-    minus_dm = pd.Series(
-        np.where((down > up) & (down > 0), down, 0.0),
-        index=frame.index
-    )
-
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-
-    atr = tr.ewm(
-        alpha=1 / length, adjust=False,
-        min_periods=length
-    ).mean()
-
-    plus_di = 100 * (
-        plus_dm.ewm(
-            alpha=1 / length, adjust=False,
-            min_periods=length
-        ).mean() / atr.replace(0, np.nan)
-    )
-
-    minus_di = 100 * (
-        minus_dm.ewm(
-            alpha=1 / length, adjust=False,
-            min_periods=length
-        ).mean() / atr.replace(0, np.nan)
-    )
-
-    dx = (
-        100 * (plus_di - minus_di).abs() /
-        (plus_di + minus_di).replace(0, np.nan)
-    )
-
-    adx = dx.ewm(
-        alpha=1 / length,
-        adjust=False,
-        min_periods=length
-    ).mean()
-
-    return plus_di, minus_di, adx
-
-
-def calculate_trend(history, intraday, now):
-    if intraday.empty:
-        return None, "Today's intraday candles unavailable."
-
-    today = now.date()
-
-    current = intraday[intraday.index.date == today]
-
+def trend_calc(history,current,now):
     if current.empty:
-        return None, "No current-session candles."
-
-    if now.time() < time(9, 30):
-        return {
-            "direction": "OPENING / WAIT",
-            "confidence": "LOW",
-            "reason": "Wait for 09:15–09:30 opening range."
-        }, None
-
+        return None,'Current-session 1-minute candles unavailable'
+    today=now.date()
+    current=current[current.index.date==today]
+    if current.empty:
+        return None,'No candles from today'
+    if now.time()<time(9,30):
+        return {'direction':'OPENING / WAIT','confidence':'LOW'},None
     if history.empty:
-        return None, "Previous-session history unavailable."
-
-    combined = pd.concat([history, current])
-    combined = combined[
-        ~combined.index.duplicated(keep="last")
-    ].sort_index()
-
-    bars = five_minute_candles(combined, now)
-
-    if len(bars) < 40:
-        return None, "Insufficient historical 5-minute candles."
-
-    bars["ema9"] = bars.close.ewm(
-        span=9, adjust=False
-    ).mean()
-
-    bars["ema20"] = bars.close.ewm(
-        span=20, adjust=False
-    ).mean()
-
-    bars["rsi9"] = calculate_rsi(bars.close, 9)
-
-    plus_di, minus_di, adx = calculate_adx(bars, 14)
-
-    bars["plus_di"] = plus_di
-    bars["minus_di"] = minus_di
-    bars["adx"] = adx
-
-    today_bars = bars[bars.index.date == today]
-
-    if len(today_bars) < 3:
-        return {
-            "direction": "OPENING / WAIT",
-            "confidence": "LOW",
-            "reason": "Three completed 5-minute candles required."
-        }, None
-
-    latest = today_bars.iloc[-1]
-
-    # Today's VWAP from 1-minute index data, when valid volume exists.
-    # Index volume may be unavailable/zero, so never invent VWAP.
-    today_minutes = current[
-        current.index + pd.Timedelta(minutes=1)
-        <= pd.Timestamp(now)
-    ]
-
-    vol = today_minutes.volume.fillna(0)
-    valid_volume = vol.sum() > 0
-
-    vwap = None
-
-    if valid_volume:
-        typical = (
-            today_minutes.high +
-            today_minutes.low +
-            today_minutes.close
-        ) / 3
-
-        vwap = float((typical * vol).sum() / vol.sum())
-
-    opening = today_bars.iloc[:3]
-    opening_high = float(opening.high.max())
-    opening_low = float(opening.low.min())
-
-    close = float(latest.close)
-    ema9 = float(latest.ema9)
-    ema20 = float(latest.ema20)
-    rsi = number(latest.rsi9, None)
-    adx_value = number(latest.adx, None)
-    plus = number(latest.plus_di, None)
-    minus = number(latest.minus_di, None)
-
-    bullish = (
-        close > ema9 and
-        ema9 > ema20 and
-        rsi is not None and rsi > 52
-    )
-
-    bearish = (
-        close < ema9 and
-        ema9 < ema20 and
-        rsi is not None and rsi < 48
-    )
-
-    breakout_up = close > opening_high
-    breakout_down = close < opening_low
-
-    if bullish and (breakout_up or close > opening_low):
-        direction = "BULLISH"
-    elif bearish and (breakout_down or close < opening_high):
-        direction = "BEARISH"
-    else:
-        direction = "NEUTRAL"
-
-    if (
-        adx_value is not None and
-        adx_value >= 25 and
-        (
-            (direction == "BULLISH" and plus > minus)
-            or
-            (direction == "BEARISH" and minus > plus)
-        )
-    ):
-        confidence = "STRONG"
-    elif direction != "NEUTRAL":
-        confidence = "EARLY / MODERATE"
-    else:
-        confidence = "LOW / MIXED"
-
-    if len(today_bars) <= 4:
-        confidence = "EARLY / LOW"
-
-    return {
-        "direction": direction,
-        "confidence": confidence,
-        "close": close,
-        "ema9": ema9,
-        "ema20": ema20,
-        "rsi": rsi,
-        "adx": adx_value,
-        "plus_di": plus,
-        "minus_di": minus,
-        "vwap": vwap,
-        "opening_high": opening_high,
-        "opening_low": opening_low,
-        "last_bar": str(today_bars.index[-1])
-    }, None
+        return None,'Previous-session history unavailable'
+    merged=pd.concat([history,current]).sort_index()
+    merged=merged[~merged.index.duplicated(keep='last')].between_time('09:15','15:29')
+    counts=merged.close.resample('5min').count()
+    bars=merged.resample('5min').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'})
+    bars=bars[(counts==5) & (bars.index+pd.Timedelta(minutes=5)<=pd.Timestamp(now))].dropna(subset=['close'])
+    if len(bars)<40:
+        return None,f'Only {len(bars)} complete 5-minute bars (need 40 including history)'
+    bars['ema9']=bars.close.ewm(span=9,adjust=False).mean()
+    bars['ema20']=bars.close.ewm(span=20,adjust=False).mean()
+    change=bars.close.diff()
+    gain=change.clip(lower=0).ewm(alpha=1/9,adjust=False,min_periods=9).mean()
+    loss=(-change.clip(upper=0)).ewm(alpha=1/9,adjust=False,min_periods=9).mean()
+    bars['rsi']=100-100/(1+gain/loss.replace(0,np.nan))
+    bars.loc[(loss==0)&(gain>0),'rsi']=100
+    bars.loc[(gain==0)&(loss>0),'rsi']=0
+    up=bars.high.diff(); down=-bars.low.diff()
+    pdm=pd.Series(np.where((up>down)&(up>0),up,0),index=bars.index)
+    mdm=pd.Series(np.where((down>up)&(down>0),down,0),index=bars.index)
+    tr=pd.concat([bars.high-bars.low,(bars.high-bars.close.shift()).abs(),(bars.low-bars.close.shift()).abs()],axis=1).max(axis=1)
+    atr=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    plus=100*pdm.ewm(alpha=1/14,adjust=False,min_periods=14).mean()/atr.replace(0,np.nan)
+    minus=100*mdm.ewm(alpha=1/14,adjust=False,min_periods=14).mean()/atr.replace(0,np.nan)
+    dx=100*(plus-minus).abs()/(plus+minus).replace(0,np.nan)
+    bars['adx']=dx.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    bars['plus']=plus;bars['minus']=minus
+    today_bars=bars[bars.index.date==today]
+    if len(today_bars)<3:
+        return {'direction':'OPENING / WAIT','confidence':'LOW'},None
+    last=today_bars.iloc[-1]
+    if now-last.name.to_pydatetime()>timedelta(minutes=12):
+        return None,'Latest completed 5-minute candle is stale'
+    opening=today_bars.iloc[:3]
+    opening_high=opening.high.max();opening_low=opening.low.min()
+    bull=last.close>last.ema9>last.ema20 and last.rsi>52
+    bear=last.close<last.ema9<last.ema20 and last.rsi<48
+    direction='BULLISH' if bull else 'BEARISH' if bear else 'NEUTRAL'
+    strong=np.isfinite(last.adx) and last.adx>=25 and ((bull and last.plus>last.minus) or (bear and last.minus>last.plus))
+    confidence='EARLY / LOW' if len(today_bars)<=4 else 'STRONG' if strong else 'MODERATE' if direction!='NEUTRAL' else 'MIXED'
+    valid_minutes=current[current.index+pd.Timedelta(minutes=1)<=pd.Timestamp(now)]
+    volume=valid_minutes.volume.clip(lower=0)
+    vwap=(((valid_minutes.high+valid_minutes.low+valid_minutes.close)/3)*volume).sum()/volume.sum() if volume.sum()>0 else np.nan
+    return {'direction':direction,'confidence':confidence,'close':last.close,'ema9':last.ema9,'ema20':last.ema20,
+            'rsi':last.rsi,'adx':last.adx,'vwap':vwap,'opening_high':opening_high,'opening_low':opening_low,
+            'bar':str(last.name),'bars_today':len(today_bars)},None
 
 
-st.title("NIFTY F&O | Option Chain + Market Trend")
-st.caption(
-    "Two independent systems | Trend from 09:30 AM | "
-    "Research only | No automatic orders"
-)
-
+st.title('NSE Options | Option Chain + Independent Trend')
+st.caption('NIFTY / BANK NIFTY / NSE stock options • Research only • No automatic orders')
 with st.sidebar:
-    st.header("Connection")
-
-    token = st.text_input(
-        "Upstox Access Token",
-        value=os.environ.get("UPSTOX_ACCESS_TOKEN", ""),
-        type="password"
-    )
-
-    underlying = st.selectbox(
-        "Underlying",
-        list(INDEX_KEYS.keys())
-    )
-
-    instrument_key = INDEX_KEYS[underlying]
-
-    expiry_input = st.text_input(
-        "Expiry",
-        value="current_week",
-        help="current_week or YYYY-MM-DD"
-    )
-
-    st.header("Option Chain Filters")
-
-    max_spread = st.slider(
-        "Maximum spread %",
-        0.5, 10.0, 3.0, 0.5
-    )
-
-    max_iv = st.slider(
-        "Maximum IV %",
-        10, 100, 40
-    )
-
-    min_volume = st.number_input(
-        "Minimum volume",
-        min_value=0,
-        value=10000,
-        step=1000
-    )
-
-    min_score = st.slider(
-        "Minimum BUY score",
-        4, 7, 6
-    )
-
-    rr = st.slider(
-        "Illustrative reward/risk",
-        1.0, 3.0, 1.75, 0.25
-    )
-
-    auto = st.toggle(
-        "Auto-refresh every 30 seconds",
-        value=False
-    )
-
-
-if "previous" not in st.session_state:
-    st.session_state.previous = {}
-
-if "identity" not in st.session_state:
-    st.session_state.identity = ""
-
-if "refresh_requested" not in st.session_state:
-    st.session_state.refresh_requested = False
-
-
-@st.fragment(run_every="30s" if auto else None)
-def dashboard():
-    if st.button("Fetch / Refresh Now", type="primary"):
-        st.session_state.refresh_requested = True
-
-    if not token:
-        st.info("Enter your Upstox token in the sidebar.")
-        return
-
-    if not auto and not st.session_state.refresh_requested:
-        st.info("Click Fetch / Refresh Now.")
-        return
-
-    st.session_state.refresh_requested = False
-
-    now = datetime.now(IST)
-
-    market_hours = (
-        now.weekday() < 5 and
-        time(9, 15) <= now.time() <= time(15, 30)
-    )
-
-    # This checks weekday and time, not the NSE holiday calendar.
-    st.caption(
-        f"Last fetch attempt: {now:%d %b %Y %I:%M:%S %p} IST"
-    )
-
-    if not market_hours:
-        st.warning(
-            "Outside regular market hours. Historical/stale "
-            "quotes may appear. Live BUY disabled."
-        )
-
-    identity = f"{instrument_key}:{expiry_input}"
-
-    if identity != st.session_state.identity:
-        st.session_state.previous = {}
-        st.session_state.identity = identity
-
-    st.header("1. OPTION CHAIN + GREEKS (INDEPENDENT)")
-
-    chain = pd.DataFrame()
-    expiry = None
-
-    try:
-        expiry = get_expiry(
-            token, instrument_key, expiry_input
-        )
-
-        chain = get_chain(
-            token, instrument_key, expiry
-        )
-
-    except Exception as exc:
-        st.error(f"Option Chain unavailable: {exc}")
-
-    ce_best = None
-    pe_best = None
-
-    if not chain.empty:
-        spot = float(chain.spot.iloc[0])
-
-        ce_total = chain.loc[chain.side == "CE", "oi"].sum()
-        pe_total = chain.loc[chain.side == "PE", "oi"].sum()
-        pcr = pe_total / ce_total if ce_total > 0 else None
-
-        a, b, c, d = st.columns(4)
-
-        a.metric("Spot", f"{spot:,.2f}")
-        b.metric(
-            "PCR",
-            f"{pcr:.2f}" if pcr is not None else "N/A"
-        )
-        c.metric("CE total OI", f"{ce_total:,.0f}")
-        d.metric("PE total OI", f"{pe_total:,.0f}")
-
-        st.caption(f"Selected expiry: {expiry}")
-
-        previous = st.session_state.previous
-
-        ce = score_options(
-            chain, "CE", max_spread, max_iv,
-            min_volume, previous, now
-        )
-
-        pe = score_options(
-            chain, "PE", max_spread, max_iv,
-            min_volume, previous, now
-        )
-
-        left, right = st.columns(2)
-
-        for col, side, candidates in [
-            (left, "CALL (CE)", ce),
-            (right, "PUT (PE)", pe)
-        ]:
-            with col:
-                st.subheader(f"Top 3 {side} candidates")
-
-                if candidates.empty:
-                    st.warning("No eligible contracts.")
-                    continue
-
-                view = candidates.copy()
-
-                view["Entry*"] = view["entry"].round(2)
-                view["SL*"] = (
-                    view["entry"] - view["risk"]
-                ).clip(lower=0.05).round(2)
-
-                view["Target*"] = (
-                    view["entry"] + view["risk"] * rr
-                ).round(2)
-
-                view["Score"] = (
-                    view["score"].astype(str) + "/7"
-                )
-
-                st.dataframe(
-                    view[[
-                        "strike", "Score", "ltp",
-                        "delta", "iv", "spread_pct",
-                        "Entry*", "SL*", "Target*"
-                    ]],
-                    hide_index=True,
-                    use_container_width=True
-                )
-
-                best = candidates.iloc[0]
-
-                if side == "CALL (CE)":
-                    ce_best = best
-                else:
-                    pe_best = best
-
-                status = (
-                    "BUY CANDIDATE"
-                    if market_hours
-                    and best["score"] >= min_score
-                    and best["fresh"]
-                    else "WAIT"
-                )
-
-                st.write(
-                    f"**Best candidate:** "
-                    f"{best['strike']:g} {best['side']} | "
-                    f"Score {best['score']}/7"
-                )
-
-                st.write(f"**Chain status:** {status}")
-
-                with st.expander("Why this score?"):
-                    for reason in best["reasons"]:
-                        st.success(reason)
-                    for reason in best["failures"]:
-                        st.warning(reason)
-
-        with st.expander("Full option chain and Greeks"):
-            st.dataframe(
-                chain,
-                hide_index=True,
-                use_container_width=True
-            )
-
-        st.session_state.previous = {
-            row.instrument: {
-                "ltp": row.ltp,
-                "time": now
-            }
-            for _, row in chain.iterrows()
-            if row.instrument and row.ltp > 0
-        }
-
-    else:
-        st.warning("No option-chain data available.")
-
-    st.caption(
-        "*Entry uses ask/LTP. SL uses illustrative 12% "
-        "premium risk; target uses selected R:R. "
-        "These are not validated trade levels."
-    )
-
-    st.divider()
-    st.header("2. MARKET TREND (INDEPENDENT)")
-
-    trend = None
-    trend_error = None
-
-    if not market_hours:
-        st.info(
-            "TREND: UNAVAILABLE — market outside regular hours."
-        )
-
+    token=st.text_input('Upstox Algo Trading Access Token',value=os.getenv('UPSTOX_ACCESS_TOKEN',''),type='password')
+    category=st.radio('Instrument type',['Index Options','Stock Options'])
+    if category=='Index Options':
+        name=st.selectbox('Index',list(INDEXES))
+        key=INDEXES[name]
     else:
         try:
-            history = get_history_candles(
-                token, instrument_key, now.date()
-            )
-
-            intraday = get_intraday_candles(
-                token, instrument_key
-            )
-
-            trend, trend_error = calculate_trend(
-                history, intraday, now
-            )
-
+            universe=instruments()
+            selected=st.selectbox('Search NSE stock',universe.index.tolist(),format_func=lambda i:f"{universe.loc[i,'symbol']} — {universe.loc[i,'name']}")
+            name=universe.loc[selected,'symbol'];key=universe.loc[selected,'key']
         except Exception as exc:
-            trend_error = str(exc)
+            st.error(f'Could not load NSE stocks: {exc}')
+            st.stop()
+    st.caption('Only stocks with available option contracts will be supported.')
+    expiry_choice=st.selectbox('Expiry',['Auto: nearest available','Enter manually'])
+    expiry_manual=st.text_input('Expiry YYYY-MM-DD',value='2026-11-23') if expiry_choice=='Enter manually' else ''
+    st.header('Option Chain filters')
+    min_vol=st.number_input('Minimum option volume',min_value=0,value=10000,step=1000)
+    max_spread=st.slider('Maximum bid/ask spread %',0.5,10.0,3.0,0.5)
+    max_iv=st.slider('Maximum IV %',10,100,40)
+    min_score=st.slider('BUY screening score / 7',4,7,6)
+    rr=st.slider('Illustrative reward/risk',1.0,3.0,1.75,0.25)
+    auto=st.toggle('Auto-refresh every 30 seconds',value=False)
 
-        if trend_error:
-            st.warning(
-                "TREND: UNAVAILABLE — " + trend_error
-            )
+for field,default in [('identity',''),('prior',{}),('prior_time',None)]:
+    if field not in st.session_state:st.session_state[field]=default
 
-        elif trend:
-            direction = trend["direction"]
-            confidence = trend["confidence"]
-
-            if direction == "BULLISH":
-                st.success(f"TREND: BULLISH | {confidence}")
-            elif direction == "BEARISH":
-                st.error(f"TREND: BEARISH | {confidence}")
-            else:
-                st.info(f"TREND: {direction} | {confidence}")
-
-            if "close" in trend:
-                a, b, c, d = st.columns(4)
-
-                a.metric(
-                    "NIFTY / Index",
-                    f"{trend['close']:.2f}"
-                )
-                b.metric(
-                    "EMA 9",
-                    f"{trend['ema9']:.2f}"
-                )
-                c.metric(
-                    "EMA 20",
-                    f"{trend['ema20']:.2f}"
-                )
-                d.metric(
-                    "RSI 9",
-                    f"{trend['rsi']:.1f}"
-                    if trend["rsi"] is not None else "N/A"
-                )
-
-                a, b, c = st.columns(3)
-
-                a.metric(
-                    "ADX",
-                    f"{trend['adx']:.1f}"
-                    if trend["adx"] is not None else "N/A"
-                )
-
-                b.metric(
-                    "Opening High",
-                    f"{trend['opening_high']:.2f}"
-                )
-
-                c.metric(
-                    "Opening Low",
-                    f"{trend['opening_low']:.2f}"
-                )
-
-                st.write(
-                    "**VWAP:** " +
-                    (
-                        f"{trend['vwap']:.2f}"
-                        if trend["vwap"] is not None
-                        else "Unavailable from index volume"
-                    )
-                )
-
-                st.caption(
-                    f"Last completed 5-minute bar: "
-                    f"{trend['last_bar']}"
-                )
-
+@st.fragment(run_every='30s' if auto else None)
+def dashboard():
+    clicked=st.button('Fetch / Refresh Now',type='primary')
+    if not token:
+        st.info('Enter your token in the sidebar. Never share it in chat or screenshots.');return
+    if not auto and not clicked:
+        st.info('Click Fetch / Refresh Now or enable auto-refresh.');return
+    now=datetime.now(IST)
+    open_window=now.weekday()<5 and time(9,15)<=now.time()<=time(15,30)
+    st.caption(f'Last fetch: {now:%d %b %Y %I:%M:%S %p} IST')
+    if not open_window:st.warning('Outside regular NSE hours. Live BUY disabled; quotes may be stale.')
+    st.header('1. OPTION CHAIN + GREEKS — INDEPENDENT')
+    chain=pd.DataFrame(); ce=[];pe=[]
+    try:
+        expiries=contracts(token,key)
+        if not expiries:raise RuntimeError('No currently listed option contracts for this stock/index. Choose an F&O instrument.')
+        expiry=expiries[0] if expiry_choice=='Auto: nearest available' else expiry_manual.strip()
+        if expiry not in expiries:raise RuntimeError(f'Expiry {expiry} not available. Available: {", ".join(expiries[:8])}')
+        identity=f'{key}:{expiry}'
+        if identity!=st.session_state.identity:
+            st.session_state.identity=identity;st.session_state.prior={};st.session_state.prior_time=None
+        chain=option_chain(token,key,expiry)
+        if chain.empty:raise RuntimeError('Option chain returned no rows')
+        st.caption(f'Instrument: {name} | Expiry: {expiry}')
+        spot=n(chain.spot.dropna().iloc[0]) if chain.spot.notna().any() else np.nan
+        ce_oi=chain.loc[chain.side=='CE','oi'].sum();pe_oi=chain.loc[chain.side=='PE','oi'].sum()
+        a,b,c,d=st.columns(4)
+        a.metric('Spot',f'{spot:,.2f}' if np.isfinite(spot) else 'N/A')
+        b.metric('PCR',f'{pe_oi/ce_oi:.2f}' if ce_oi>0 else 'N/A')
+        c.metric('CE OI',f'{ce_oi:,.0f}');d.metric('PE OI',f'{pe_oi:,.0f}')
+        prior=st.session_state.prior if open_window else {}
+        prior_time=st.session_state.prior_time if open_window else None
+        ce=candidate_list(chain,'CE',prior,prior_time,now,min_vol,max_spread,max_iv,rr)
+        pe=candidate_list(chain,'PE',prior,prior_time,now,min_vol,max_spread,max_iv,rr)
+        left,right=st.columns(2)
+        for col,label,items in [(left,'CALL (CE)',ce),(right,'PUT (PE)',pe)]:
+            with col:
+                st.subheader(label+' Top 3')
+                if not items:
+                    st.info('No near-ATM candidate with positive premium');continue
+                rows=[{'Strike':f"{x['strike']:g} {x['side']}",'Score':f"{x['score']}/7",'LTP':x['ltp'],
+                       'Delta':x['delta'],'IV':x['iv'],'Spread %':x['spread'],
+                       'Entry*':round(x['entry'],2),'SL*':round(x['sl'],2),'Target*':round(x['target'],2)} for x in items]
+                st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
+                best=items[0]
+                status='BUY CANDIDATE' if open_window and best['fresh'] and best['premium_up'] and best['score']>=min_score else 'WAIT'
+                st.write(f"**Chain status:** {status} | **Best:** {best['strike']:g} {best['side']} ({best['score']}/7)")
+                with st.expander('Why this score?'):
+                    for check,passed in best['checks'].items():
+                        st.write(('✅ ' if passed else '❌ ')+check)
+        with st.expander('Full Option Chain + Greeks'):
+            view=chain.drop(columns=['instrument'])
+            st.dataframe(view,hide_index=True,use_container_width=True)
+            st.download_button('Download CSV',view.to_csv(index=False),file_name='option_chain.csv',mime='text/csv')
+        if open_window:
+            st.session_state.prior={r.instrument:r.ltp for _,r in chain.iterrows() if r.instrument and np.isfinite(r.ltp) and r.ltp>0}
+            st.session_state.prior_time=now
+        else:
+            st.session_state.prior={};st.session_state.prior_time=None
+    except Exception as exc:
+        st.error(f'Option Chain unavailable: {exc}')
+    st.caption('*Entry/SL/Target are illustrative option-premium levels, not validated trading levels. OI change is vs previous close.')
     st.divider()
-    st.header("3. SIGNAL AGREEMENT (INFORMATION ONLY)")
-
-    if ce_best is None or pe_best is None:
-        st.info("Option-chain comparison unavailable.")
-
-    elif trend is None or "close" not in trend:
-        st.info(
-            "Trend unavailable. Option Chain candidates "
-            "remain independent and unblocked."
-        )
-
+    st.header('2. MARKET / STOCK TREND — INDEPENDENT')
+    trend=None
+    if not open_window:
+        st.info('TREND: UNAVAILABLE — market closed')
     else:
-        ce_score = int(ce_best["score"])
-        pe_score = int(pe_best["score"])
-
-        if ce_score == pe_score:
-            chain_bias = "NO DIRECTIONAL EDGE"
-        elif ce_score > pe_score:
-            chain_bias = "CE LEADING"
-        else:
-            chain_bias = "PE LEADING"
-
-        direction = trend["direction"]
-
-        st.write(f"**Option Chain:** {chain_bias}")
-        st.write(f"**Market Trend:** {direction}")
-
-        if chain_bias == "NO DIRECTIONAL EDGE":
-            st.info(
-                "Chain scores are tied. No directional "
-                "preference from this scoring system."
-            )
-
-        elif (
-            chain_bias == "CE LEADING"
-            and direction == "BULLISH"
-        ) or (
-            chain_bias == "PE LEADING"
-            and direction == "BEARISH"
-        ):
-            st.success("ALIGNED — both systems agree.")
-
-        elif direction == "NEUTRAL":
-            st.info("MIXED — market trend is neutral.")
-
-        else:
-            st.warning(
-                "CONFLICT — Option Chain and market "
-                "trend do not agree."
-            )
-
-    st.warning(
-        "Research-only screening. Scores are heuristic, "
-        "not a validated profitable strategy. "
-        "OI change versus previous close does not "
-        "prove fresh writing or buying. "
-        "A single snapshot is insufficient for trading."
-    )
-
+        try:
+            history,current=candle_data(token,key,now)
+            trend,error=trend_calc(history,current,now)
+            if error:st.warning('TREND: UNAVAILABLE — '+error)
+            elif trend:
+                status=trend['direction']
+                if status=='BULLISH':st.success(f"TREND: {status} | {trend['confidence']}")
+                elif status=='BEARISH':st.error(f"TREND: {status} | {trend['confidence']}")
+                else:st.info(f"TREND: {status} | {trend['confidence']}")
+                if 'close' in trend:
+                    a,b,c,d=st.columns(4)
+                    a.metric('Last 5m close',f"{trend['close']:.2f}")
+                    b.metric('EMA 9',f"{trend['ema9']:.2f}")
+                    c.metric('EMA 20',f"{trend['ema20']:.2f}")
+                    d.metric('RSI 9',f"{trend['rsi']:.1f}")
+                    st.write(f"ADX: {trend['adx']:.1f} | VWAP: {trend['vwap']:.2f}" if np.isfinite(trend['vwap']) else f"ADX: {trend['adx']:.1f} | VWAP unavailable (index volume may be zero)")
+                    st.write(f"Opening high: {trend['opening_high']:.2f} | Opening low: {trend['opening_low']:.2f}")
+                    st.caption(f"Last completed bar: {trend['bar']}")
+        except Exception as exc:
+            st.warning(f'TREND: UNAVAILABLE — {exc}')
+    st.divider()
+    st.header('3. SIGNAL AGREEMENT — INFORMATION ONLY')
+    if not ce or not pe:st.info('Chain comparison unavailable')
+    elif not trend or 'close' not in trend:st.info('Trend unavailable; CE/PE chain candidates above remain unblocked')
+    else:
+        bias='CE LEADING' if ce[0]['score']>pe[0]['score'] else 'PE LEADING' if pe[0]['score']>ce[0]['score'] else 'NO DIRECTIONAL EDGE'
+        direction=trend['direction']
+        st.write(f'Chain score comparison: **{bias}** | Price trend: **{direction}**')
+        if bias=='NO DIRECTIONAL EDGE':st.info('Equal scores — no directional preference from chain score')
+        elif (bias=='CE LEADING' and direction=='BULLISH') or (bias=='PE LEADING' and direction=='BEARISH'):
+            st.success('ALIGNED (informational only)')
+        elif direction=='NEUTRAL':st.info('MIXED — neutral trend')
+        else:st.warning('CONFLICT — chain and trend disagree; chain signals are not blocked')
+    st.warning('Research only; heuristic signals are not backtested or guaranteed. No orders are placed. Weekday/time check does not verify exchange holidays.')
 
 dashboard()
