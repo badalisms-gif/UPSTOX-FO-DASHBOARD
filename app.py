@@ -1,704 +1,284 @@
 
 import os
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
-
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-st.set_page_config(
-    page_title="Upstox F&O Directional Dashboard",
-    page_icon="📊",
-    layout="wide"
-)
-
-IST = ZoneInfo("Asia/Kolkata")
-BASE = "https://api.upstox.com/v2"
-
-KEYS = {
-    "NIFTY 50": "NSE_INDEX|Nifty 50",
-    "BANK NIFTY": "NSE_INDEX|Nifty Bank",
-    "FIN NIFTY": "NSE_INDEX|Nifty Fin Service"
-}
+st.set_page_config(page_title='NIFTY F&O | Single Decision V2', page_icon='📊', layout='wide')
+IST = ZoneInfo('Asia/Kolkata')
+BASE = 'https://api.upstox.com/v2'
+SESSION = requests.Session()
 
 
-def number(value, default=0.0):
+def num(x, default=np.nan):
     try:
-        if value is None:
-            return default
-        return float(value)
+        return float(x) if x is not None else default
     except (TypeError, ValueError):
         return default
 
 
-def api_get(path, token, params):
-    response = requests.get(
-        BASE + path,
-        params=params,
-        headers={
-            "Authorization": "Bearer " + token,
-            "Accept": "application/json"
-        },
-        timeout=20
-    )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Upstox HTTP {response.status_code}: "
-            + response.text[:250]
-        )
-
-    payload = response.json()
-
-    if payload.get("status") != "success":
-        raise RuntimeError(str(
-            payload.get("errors")
-            or payload.get("message")
-            or "Unknown API error"
-        ))
-
-    return payload.get("data") or []
+def api_get(path, token, params=None):
+    r = SESSION.get(BASE + path, params=params or {}, headers={'Authorization': 'Bearer ' + token, 'Accept': 'application/json'}, timeout=20)
+    if not r.ok:
+        raise RuntimeError(f'Upstox HTTP {r.status_code}: {r.text[:200]}')
+    payload = r.json()
+    if payload.get('status') != 'success':
+        raise RuntimeError(str(payload.get('errors') or payload.get('message') or 'API error'))
+    return payload.get('data') or []
 
 
-def unpack_chain(chain):
-    records = []
-
-    for item in chain:
-        strike = number(item.get("strike_price"))
-        spot = number(item.get("underlying_spot_price"))
-
-        for side, key in [
-            ("CE", "call_options"),
-            ("PE", "put_options")
-        ]:
-            option = item.get(key) or {}
-            market = option.get("market_data") or {}
-            greeks = option.get("option_greeks") or {}
-
-            bid = number(market.get("bid_price"))
-            ask = number(market.get("ask_price"))
-            oi = number(market.get("oi"))
-            prev_oi = number(market.get("prev_oi"))
-
-            spread = None
-
-            if ask >= bid > 0:
-                spread = (
-                    (ask - bid) / ((ask + bid) / 2)
-                ) * 100
-
-            records.append({
-                "strike": strike,
-                "side": side,
-                "spot": spot,
-                "ltp": number(market.get("ltp")),
-                "oi": oi,
-                "prev_oi": prev_oi,
-                "oi_change_day": oi - prev_oi,
-                "volume": number(market.get("volume")),
-                "bid": bid,
-                "ask": ask,
-                "spread_pct": spread,
-                "iv": number(greeks.get("iv"), None),
-                "delta": number(greeks.get("delta"), None),
-                "gamma": number(greeks.get("gamma"), None),
-                "theta": number(greeks.get("theta"), None),
-                "vega": number(greeks.get("vega"), None),
-                "instrument": option.get("instrument_key", "")
-            })
-
-    return pd.DataFrame(records)
+def chain_df(raw):
+    out = []
+    for item in raw:
+        for side, key in [('CE', 'call_options'), ('PE', 'put_options')]:
+            opt = item.get(key) or {}
+            md = opt.get('market_data') or {}
+            gr = opt.get('option_greeks') or {}
+            bid, ask = num(md.get('bid_price')), num(md.get('ask_price'))
+            spread = (100 * (ask - bid) / ((ask + bid) / 2)) if np.isfinite(bid) and np.isfinite(ask) and ask >= bid > 0 else np.nan
+            oi, prev = num(md.get('oi'), 0), num(md.get('prev_oi'), 0)
+            out.append({'strike': num(item.get('strike_price')), 'side': side,
+                        'spot': num(item.get('underlying_spot_price')),
+                        'ltp': num(md.get('ltp')), 'oi': oi, 'prev_oi': prev,
+                        'oi_change_close': oi - prev, 'volume': num(md.get('volume'), 0),
+                        'bid': bid, 'ask': ask, 'spread_pct': spread,
+                        'iv': num(gr.get('iv')), 'delta': num(gr.get('delta')),
+                        'gamma': num(gr.get('gamma')), 'theta': num(gr.get('theta')),
+                        'vega': num(gr.get('vega')), 'instrument': opt.get('instrument_key', '')})
+    return pd.DataFrame(out)
 
 
-def market_is_open(now):
-    return (
-        now.weekday() < 5
-        and time(9, 15) <= now.time() <= time(15, 30)
-    )
+def candles(token, key):
+    # Intraday candle endpoint returns the current session's 5-minute OHLCV.
+    data = api_get('/historical-candle/intraday/' + requests.utils.quote(key, safe='') + '/5minute', token)
+    rows = data.get('candles', []) if isinstance(data, dict) else []
+    if not rows:
+        raise RuntimeError('No 5-minute NIFTY candles available')
+    frame = pd.DataFrame(rows)
+    if frame.shape[1] < 6:
+        raise RuntimeError('Unexpected candle format')
+    frame = frame.iloc[:, :6]
+    frame.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+    frame['timestamp'] = pd.to_datetime(frame['timestamp'], utc=True).dt.tz_convert(IST)
+    for c in ['open', 'high', 'low', 'close', 'volume']:
+        frame[c] = pd.to_numeric(frame[c], errors='coerce')
+    return frame.dropna(subset=['timestamp', 'open', 'high', 'low', 'close']).sort_values('timestamp').drop_duplicates('timestamp').reset_index(drop=True)
 
 
-def analyze_side(
-    df, side, previous, spot_change,
-    max_spread, max_iv, min_volume, rr
-):
-    if df.empty:
-        return []
-
-    spot = number(df["spot"].iloc[0])
-
-    strikes = sorted(df["strike"].unique())
-
-    gaps = [
-        b - a
-        for a, b in zip(strikes[:-1], strikes[1:])
-        if b > a
-    ]
-
-    step = min(gaps) if gaps else 50
-
-    candidates = df[
-        (df["side"] == side)
-        & (abs(df["strike"] - spot) <= step * 3)
-        & (df["ltp"] > 0)
-        & (df["ask"] > 0)
-    ].copy()
-
-    opposite = "PE" if side == "CE" else "CE"
-
-    opposite_df = df[df["side"] == opposite]
-
-    if side == "CE":
-        wall = opposite_df[
-            (opposite_df["strike"] <= spot)
-            & (opposite_df["strike"] >= spot - step * 2)
-        ]
-    else:
-        wall = opposite_df[
-            (opposite_df["strike"] >= spot)
-            & (opposite_df["strike"] <= spot + step * 2)
-        ]
-
-    wall_change = wall["oi_change_day"].sum()
-
-    results = []
-
-    for _, row in candidates.iterrows():
-
-        reasons = []
-        failures = []
-
-        previous_row = previous.get(row["instrument"])
-
-        premium_change = None
-        live_oi_change = None
-
-        if previous_row is not None:
-            premium_change = (
-                row["ltp"] - previous_row["ltp"]
-            )
-            live_oi_change = (
-                row["oi"] - previous_row["oi"]
-            )
-
-        # Seven screening checks.
-        checks = [
-            (
-                wall_change > 0,
-                "Supporting opposite-side OI buildup"
-            ),
-            (
-                row["oi_change_day"] > 0,
-                "Selected contract OI above previous close"
-            ),
-            (
-                row["volume"] >= min_volume,
-                "Volume threshold passed"
-            ),
-            (
-                row["spread_pct"] is not None
-                and 0 <= row["spread_pct"] <= max_spread,
-                "Bid/ask spread acceptable"
-            ),
-            (
-                row["delta"] is not None
-                and 0.35 <= abs(row["delta"]) <= 0.75,
-                "Delta in preferred range"
-            ),
-            (
-                row["iv"] is not None
-                and 0 < row["iv"] <= max_iv,
-                "IV within limit"
-            ),
-            (
-                premium_change is not None
-                and premium_change > 0,
-                "Premium rising since previous snapshot"
-            )
-        ]
-
-        for passed, description in checks:
-            if passed:
-                reasons.append(description)
-            else:
-                failures.append(description)
-
-        score = len(reasons)
-
-        entry = row["ask"]
-
-        risk = max(entry * 0.12, 1.0)
-
-        sl = max(0.05, entry - risk)
-        target = entry + risk * rr
-
-        direction_ok = (
-            spot_change is not None
-            and (
-                (side == "CE" and spot_change > 0)
-                or
-                (side == "PE" and spot_change < 0)
-            )
-        )
-
-        # Require actual intraday OI increase
-        # as an additional hard confirmation.
-        oi_live_ok = (
-            live_oi_change is not None
-            and live_oi_change > 0
-        )
-
-        results.append({
-            "strike": row["strike"],
-            "side": side,
-            "ltp": row["ltp"],
-            "score": score,
-            "delta": row["delta"],
-            "iv": row["iv"],
-            "spread": row["spread_pct"],
-            "oi": row["oi"],
-            "oi_change_day": row["oi_change_day"],
-            "premium_change": premium_change,
-            "live_oi_change": live_oi_change,
-            "spot_change": spot_change,
-            "direction_ok": direction_ok,
-            "oi_live_ok": oi_live_ok,
-            "entry": entry,
-            "sl": sl,
-            "target": target,
-            "reasons": reasons,
-            "failures": failures,
-            "distance": abs(row["strike"] - spot)
-        })
-
-    results.sort(
-        key=lambda x: (
-            x["score"],
-            -x["distance"]
-        ),
-        reverse=True
-    )
-
-    return results[:3]
+def rma(s, length):
+    return s.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
 
 
-def fmt_change(value):
-    if value is None:
-        return "N/A"
-    return f"{value:+,.2f}"
+def indicators(df):
+    x = df.copy()
+    x['ema9'] = x.close.ewm(span=9, adjust=False, min_periods=9).mean()
+    x['ema20'] = x.close.ewm(span=20, adjust=False, min_periods=20).mean()
+    tr = pd.concat([(x.high - x.low), (x.high - x.close.shift()).abs(), (x.low - x.close.shift()).abs()], axis=1).max(axis=1)
+    x['atr'] = rma(tr, 14)
+    up = x.high.diff()
+    down = -x.low.diff()
+    plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=x.index)
+    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=x.index)
+    sm_tr = rma(tr, 14)
+    plus_di = 100 * rma(plus_dm, 14) / sm_tr.replace(0, np.nan)
+    minus_di = 100 * rma(minus_dm, 14) / sm_tr.replace(0, np.nan)
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    x['adx'] = rma(dx, 14)
+    x['plus_di'] = plus_di
+    x['minus_di'] = minus_di
+    # NSE_INDEX volume can be 0. In that case true volume-weighted VWAP cannot be calculated.
+    x['vwap'] = np.nan
+    for _, day in x.groupby(x.timestamp.dt.date):
+        volume = day.volume.clip(lower=0)
+        if volume.sum() > 0:
+            tp = (day.high + day.low + day.close) / 3
+            x.loc[day.index, 'vwap'] = (tp * volume).cumsum() / volume.cumsum().replace(0, np.nan)
+    return x
 
 
-def display_candidates(title, items):
-    st.subheader(title)
+def direction(x, adx_min):
+    if len(x) < 35:
+        return 'NONE', 'Not enough 5-minute candles for stable indicators', None
+    r = x.iloc[-1]
+    needed = ['ema9', 'ema20', 'atr', 'adx', 'plus_di', 'minus_di']
+    if any(not np.isfinite(r[k]) for k in needed):
+        return 'NONE', 'Trend indicators not ready', r
+    if r.adx < adx_min:
+        return 'NONE', f'ADX {r.adx:.1f} below threshold {adx_min}', r
+    # NIFTY index often has zero volume, so VWAP is not a reliable mandatory filter.
+    # If valid volume-based VWAP exists, require it; otherwise use EMA + DI only.
+    bull_vwap = not np.isfinite(r.vwap) or r.close > r.vwap
+    bear_vwap = not np.isfinite(r.vwap) or r.close < r.vwap
+    if r.close > r.ema9 > r.ema20 and bull_vwap and r.plus_di > r.minus_di and r.ema9 > x.ema9.iloc[-2]:
+        return 'CE', 'Bullish 5-minute EMA/DI alignment (VWAP used only when available)', r
+    if r.close < r.ema9 < r.ema20 and bear_vwap and r.minus_di > r.plus_di and r.ema9 < x.ema9.iloc[-2]:
+        return 'PE', 'Bearish 5-minute EMA/DI alignment (VWAP used only when available)', r
+    return 'NONE', 'Trend filters disagree or market is sideways', r
 
-    if not items:
-        st.warning("No eligible contracts")
-        return
 
+def rank_options(df, side, spot, min_volume, max_spread, max_iv, prev_prices):
+    strikes = sorted(df.strike.dropna().unique())
+    steps = [b - a for a, b in zip(strikes, strikes[1:]) if b > a]
+    step = min(steps) if steps else 50
+    subset = df[(df.side == side) & ((df.strike - spot).abs() <= 3 * step)].copy()
     rows = []
-
-    for item in items:
-        rows.append({
-            "Strike": f'{item["strike"]:g} {item["side"]}',
-            "Score": f'{item["score"]}/7',
-            "LTP": round(item["ltp"], 2),
-            "Delta": item["delta"],
-            "IV": item["iv"],
-            "Spread %": item["spread"],
-            "Entry*": round(item["entry"], 2),
-            "SL*": round(item["sl"], 2),
-            "Target*": round(item["target"], 2)
-        })
-
-    st.dataframe(
-        pd.DataFrame(rows),
-        use_container_width=True,
-        hide_index=True
-    )
-
-    best = items[0]
-
-    st.write(
-        f'**Best candidate:** '
-        f'{best["strike"]:g} {best["side"]} '
-        f'| Score {best["score"]}/7'
-    )
-
-    st.write(
-        f'Spot change: {fmt_change(best["spot_change"])} '
-        f'| Premium change: '
-        f'{fmt_change(best["premium_change"])} '
-        f'| Live OI change: '
-        f'{fmt_change(best["live_oi_change"])}'
-    )
-
-    with st.expander("Why this score?"):
-        for reason in best["reasons"]:
-            st.success(reason)
-
-        for failure in best["failures"]:
-            st.warning(failure)
-
-
-st.title("Upstox F&O | Directional Signal Dashboard")
-
-st.caption(
-    "One final direction | CE / PE / NO TRADE | "
-    "Research only | No automatic orders"
-)
-
-with st.sidebar:
-
-    st.header("Connection")
-
-    token = st.text_input(
-        "Upstox Algo Trading Access Token",
-        value=os.environ.get("UPSTOX_ACCESS_TOKEN", ""),
-        type="password"
-    )
-
-    underlying = st.selectbox(
-        "Underlying",
-        list(KEYS.keys())
-    )
-
-    instrument_key = KEYS[underlying]
-
-    expiry = st.text_input(
-        "Expiry (YYYY-MM-DD)",
-        value="2026-11-23"
-    )
-
-    st.header("Signal filters")
-
-    max_spread = st.slider(
-        "Maximum bid/ask spread %",
-        0.5, 10.0, 3.0, 0.5
-    )
-
-    max_iv = st.slider(
-        "Maximum IV (%)",
-        10, 100, 40
-    )
-
-    min_volume = st.number_input(
-        "Minimum traded volume",
-        min_value=0,
-        value=10000,
-        step=1000
-    )
-
-    min_score = st.slider(
-        "Minimum BUY score",
-        4, 7, 6
-    )
-
-    rr = st.slider(
-        "Reward / Risk",
-        1.0, 3.0, 1.75, 0.25
-    )
-
-    auto = st.toggle(
-        "Auto-refresh every 30 seconds",
-        value=True
-    )
-
-    st.caption(
-        "Access token is used for your API requests. "
-        "Do not share it publicly."
-    )
-
-
-if "previous" not in st.session_state:
-    st.session_state.previous = {}
-
-if "previous_spot" not in st.session_state:
-    st.session_state.previous_spot = None
-
-if "previous_time" not in st.session_state:
-    st.session_state.previous_time = None
-
-if "last_identity" not in st.session_state:
-    st.session_state.last_identity = None
-
-if "force_refresh" not in st.session_state:
-    st.session_state.force_refresh = False
-
-
-@st.fragment(run_every="30s" if auto else None)
-def dashboard():
-
-    if st.button("Fetch / Refresh Now", type="primary"):
-        st.session_state.force_refresh = True
-
-    if not token:
-        st.info("Enter Upstox Access Token in sidebar.")
-        return
-
-    identity = instrument_key + ":" + expiry.strip()
-
-    if identity != st.session_state.last_identity:
-        st.session_state.previous = {}
-        st.session_state.previous_spot = None
-        st.session_state.previous_time = None
-        st.session_state.last_identity = identity
-
-    if not auto and not st.session_state.force_refresh:
-        st.info("Click Fetch / Refresh Now.")
-        return
-
-    st.session_state.force_refresh = False
-
-    try:
-        raw = api_get(
-            "/option/chain",
-            token,
-            {
-                "instrument_key": instrument_key,
-                "expiry_date": expiry.strip()
-            }
-        )
-
-        df = unpack_chain(raw)
-
-    except Exception as exc:
-        st.error(f"API fetch failed: {exc}")
-        return
-
-    if df.empty:
-        st.warning(
-            "No option-chain data returned. "
-            "Check expiry and contract availability."
-        )
-        return
-
-    now = datetime.now(IST)
-    open_hours = market_is_open(now)
-
-    spot = number(df["spot"].iloc[0])
-
-    ce_oi = df[df["side"] == "CE"]["oi"].sum()
-    pe_oi = df[df["side"] == "PE"]["oi"].sum()
-
-    pcr = pe_oi / ce_oi if ce_oi > 0 else 0
-
-    st.caption(
-        f'Last fetch: {now:%d %b %Y %I:%M:%S %p} IST'
-    )
-
-    if not open_hours:
-        st.warning(
-            "Outside normal trading hours. "
-            "BUY disabled; quotes may be stale."
-        )
-
-    # Only compare recent snapshots.
-    previous = st.session_state.previous
-    previous_spot = st.session_state.previous_spot
-    previous_time = st.session_state.previous_time
-
-    fresh_comparison = False
-
-    if (
-        open_hours
-        and previous_time is not None
-        and previous_spot is not None
-    ):
-        elapsed = (now - previous_time).total_seconds()
-
-        fresh_comparison = 25 <= elapsed <= 90
-
-    if fresh_comparison:
-        spot_change = spot - previous_spot
-    else:
-        spot_change = None
-        previous = {}
-
-    a, b, c, d = st.columns(4)
-
-    a.metric("NIFTY / Index Spot", f"{spot:,.2f}")
-    b.metric("Put/Call OI Ratio", f"{pcr:.2f}")
-    c.metric("CE Total OI", f"{ce_oi:,.0f}")
-    d.metric("PE Total OI", f"{pe_oi:,.0f}")
-
-    ce_items = analyze_side(
-        df, "CE", previous, spot_change,
-        max_spread, max_iv, min_volume, rr
-    )
-
-    pe_items = analyze_side(
-        df, "PE", previous, spot_change,
-        max_spread, max_iv, min_volume, rr
-    )
-
-    # Use the best eligible candidate from each side,
-    # not just the highest-ranked row.
-    def eligible(items):
-        return [
-            item for item in items
-            if item["score"] >= min_score
-            and item["direction_ok"]
-            and item["oi_live_ok"]
-            and item["premium_change"] is not None
-            and item["premium_change"] > 0
-        ]
-
-    ce_eligible = eligible(ce_items)
-    pe_eligible = eligible(pe_items)
-
-    ce_best = ce_eligible[0] if ce_eligible else None
-    pe_best = pe_eligible[0] if pe_eligible else None
-
-    st.divider()
-    st.subheader("FINAL TRADING DECISION")
-
-    final_signal = "NO TRADE"
-    selected = None
-
-    if not open_hours:
-        reason = "Market is closed."
-
-    elif not fresh_comparison:
-        reason = (
-            "Waiting for two recent market-hours "
-            "snapshots approximately 30 seconds apart."
-        )
-
-    elif spot_change == 0:
-        reason = "No observed spot movement."
-
-    elif ce_best and pe_best:
-        reason = "Both sides qualified; conflicting signals."
-
-    elif ce_best:
-        final_signal = "CALL BUY CANDIDATE"
-        selected = ce_best
-        reason = "Spot and CE premium rising with OI confirmation."
-
-    elif pe_best:
-        final_signal = "PUT BUY CANDIDATE"
-        selected = pe_best
-        reason = "Spot falling and PE premium rising with OI confirmation."
-
-    else:
-        reason = "Directional confirmation insufficient."
-
-    if selected:
-        st.success(final_signal)
-
-        st.metric(
-            "Selected Contract",
-            f'{selected["strike"]:g} {selected["side"]}'
-        )
-
-        st.metric(
-            "Confirmation Score",
-            f'{selected["score"]}/7'
-        )
-
-        x, y, z = st.columns(3)
-
-        x.metric(
-            "Indicative Entry",
-            f'₹{selected["entry"]:.2f}'
-        )
-
-        y.metric(
-            "Illustrative SL",
-            f'₹{selected["sl"]:.2f}'
-        )
-
-        z.metric(
-            "Illustrative Target",
-            f'₹{selected["target"]:.2f}'
-        )
-
-    else:
-        st.info("NO TRADE")
-
-    st.write("**Reason:**", reason)
-
-    st.caption(
-        "These are candidate signals, not validated "
-        "trade recommendations. Entry/SL/Target are "
-        "illustrative and not based on backtesting."
-    )
-
-    st.divider()
-    st.subheader("Top 3 CE / PE Candidates")
-
-    left, right = st.columns(2)
-
-    with left:
-        display_candidates("CALL (CE)", ce_items)
-
-    with right:
-        display_candidates("PUT (PE)", pe_items)
-
-    st.caption(
-        "Entry is indicative ask. SL uses 12% "
-        "premium risk and target uses selected R:R."
-    )
-
-    st.divider()
-    st.subheader("Full Option Chain + Greeks")
-
-    columns = [
-        "strike", "side", "ltp", "oi", "prev_oi",
-        "oi_change_day", "volume", "bid", "ask",
-        "spread_pct", "iv", "delta",
-        "gamma", "theta", "vega"
-    ]
-
-    view = df[columns].sort_values(
-        ["strike", "side"]
-    )
-
-    st.dataframe(
-        view,
-        use_container_width=True,
-        hide_index=True,
-        height=450
-    )
-
-    st.download_button(
-        "Download Option Chain CSV",
-        view.to_csv(index=False),
-        file_name="upstox_option_chain.csv",
-        mime="text/csv"
-    )
-
-    st.warning(
-        "Research-only heuristic. OI increase alone "
-        "does not prove buying or writing. "
-        "This dashboard does not check exchange holidays "
-        "or confirm the trend using 5-minute candles."
-    )
-
-    # Save current snapshot for the next refresh.
-    if open_hours:
-        st.session_state.previous = {
-            row["instrument"]: {
-                "ltp": row["ltp"],
-                "oi": row["oi"]
-            }
-            for _, row in df.iterrows()
-            if row["instrument"] and row["ltp"] > 0
+    for _, r in subset.iterrows():
+        if not (np.isfinite(r.ltp) and r.ltp > 0):
+            continue
+        checks = {
+            'Delta 0.35-0.75': np.isfinite(r.delta) and 0.35 <= abs(r.delta) <= 0.75,
+            'Volume': r.volume >= min_volume,
+            'Spread': np.isfinite(r.spread_pct) and 0 <= r.spread_pct <= max_spread,
+            'IV': np.isfinite(r.iv) and 0 < r.iv <= max_iv,
+            'OI present': r.oi > 0,
+            'Premium rising vs recent snapshot': r.instrument in prev_prices and r.ltp > prev_prices[r.instrument],
         }
+        score = sum(bool(v) for v in checks.values())
+        rows.append((score, abs(r.strike - spot), r, checks))
+    rows.sort(key=lambda z: (-z[0], z[1]))
+    return rows
 
-        st.session_state.previous_spot = spot
-        st.session_state.previous_time = now
 
+st.title('NIFTY F&O | Single Final Decision V2')
+st.caption('5-minute index trend + Upstox option chain. Research only. No order placement.')
+with st.sidebar:
+    st.header('Connection')
+    token = st.text_input('Upstox Algo Trading Access Token', value=os.getenv('UPSTOX_ACCESS_TOKEN', ''), type='password')
+    expiry = st.text_input('Expiry (YYYY-MM-DD)', value='2026-11-23')
+    st.header('Filters')
+    adx_min = st.slider('Minimum ADX', 15, 40, 25)
+    max_spread = st.slider('Maximum bid/ask spread %', 0.5, 10.0, 3.0, 0.5)
+    max_iv = st.slider('Maximum IV %', 10, 100, 40)
+    min_volume = st.number_input('Minimum option volume', min_value=0, value=10000, step=1000)
+    min_score = st.slider('Minimum option score / 6', 3, 6, 5)
+    rr = st.slider('Illustrative reward/risk', 1.0, 3.0, 1.75, 0.25)
+    auto = st.toggle('Auto-refresh every 30 seconds', value=False)
+    st.caption('Token is not saved to source code. Keep this dashboard private.')
+
+if 'last_prices' not in st.session_state:
+    st.session_state.last_prices = {}
+if 'last_identity' not in st.session_state:
+    st.session_state.last_identity = ''
+if 'last_market_snapshot_at' not in st.session_state:
+    st.session_state.last_market_snapshot_at = None
+
+@st.fragment(run_every='30s' if auto else None)
+def dashboard():
+    click = st.button('Fetch / Refresh Now', type='primary')
+    if not token:
+        st.info('Enter your own Upstox token in the sidebar.')
+        return
+    if not auto and not click:
+        st.info('Click Fetch / Refresh Now to load current data.')
+        return
+    now = datetime.now(IST)
+    trading_window = now.weekday() < 5 and time(9, 20) <= now.time() <= time(15, 25)
+    if not trading_window:
+        st.warning('Outside regular market window. NO TRADE. Data may be stale.')
+    identity = 'NSE_INDEX|Nifty 50:' + expiry.strip()
+    if identity != st.session_state.last_identity:
+        st.session_state.last_prices = {}
+        st.session_state.last_market_snapshot_at = None
+        st.session_state.last_identity = identity
+    try:
+        date_value = datetime.strptime(expiry.strip(), '%Y-%m-%d').date()
+        if date_value < now.date():
+            st.error('Selected expiry is in the past. Choose a current listed expiry.')
+            return
+        raw = api_get('/option/chain', token, {'instrument_key': 'NSE_INDEX|Nifty 50', 'expiry_date': expiry.strip()})
+        df = chain_df(raw)
+        if df.empty:
+            st.warning('No option chain returned for this expiry.')
+            return
+        x = indicators(candles(token, 'NSE_INDEX|Nifty 50'))
+    except (requests.RequestException, RuntimeError, ValueError, KeyError) as exc:
+        st.error(f'Data fetch/processing failed: {exc}')
+        return
+    spot = num(df.spot.dropna().iloc[0]) if df.spot.notna().any() else np.nan
+    ce_oi = df.loc[df.side == 'CE', 'oi'].sum()
+    pe_oi = df.loc[df.side == 'PE', 'oi'].sum()
+    pcr = pe_oi / ce_oi if ce_oi > 0 else np.nan
+    a, b, c = st.columns(3)
+    a.metric('NIFTY spot', f'{spot:,.2f}' if np.isfinite(spot) else 'N/A')
+    b.metric('Put/Call OI ratio', f'{pcr:.2f}' if np.isfinite(pcr) else 'N/A')
+    c.metric('5-min candles', len(x))
+    st.caption(f'API checked: {now:%d %b %Y %I:%M:%S %p} IST')
+
+    # Require a fresh *completed* candle, not a partially formed bar.
+    completed = x[x.timestamp + pd.Timedelta(minutes=5) <= pd.Timestamp(now)]
+    if completed.empty:
+        st.error('No completed 5-minute candle')
+        return
+    last_bar_time = completed.timestamp.iloc[-1]
+    recent_bar = now - last_bar_time.to_pydatetime() <= timedelta(minutes=12)
+    side, trend_reason, r = direction(completed, adx_min)
+    st.subheader('NIFTY trend')
+    st.write(f'**Direction:** {side} | **Reason:** {trend_reason}')
+    if r is not None:
+        st.write(f'EMA9: {r.ema9:.2f} | EMA20: {r.ema20:.2f} | VWAP: {r.vwap:.2f} | ADX: {r.adx:.1f} | ATR: {r.atr:.2f}')
+    st.caption(f'Last completed 5-minute bar starts {last_bar_time:%d %b %H:%M} IST')
+
+    old = st.session_state.last_prices
+    prior_time = st.session_state.last_market_snapshot_at
+    # A prior valid market-hours snapshot must exist, with a useful time gap.
+    comparison_valid = trading_window and prior_time is not None and timedelta(seconds=20) <= now - prior_time <= timedelta(minutes=3)
+    rankings = rank_options(df, side, spot, min_volume, max_spread, max_iv, old if comparison_valid else {}) if side in ('CE', 'PE') and np.isfinite(spot) else []
+    st.subheader('FINAL TRADING DECISION')
+    decision = 'NO TRADE'
+    reasons = []
+    if not trading_window:
+        reasons.append('Market is closed or outside permitted trading window')
+    if not recent_bar:
+        reasons.append('5-minute market data is stale')
+    if side == 'NONE':
+        reasons.append(trend_reason)
+    if not comparison_valid:
+        reasons.append('Waiting for two recent market-hours option-chain snapshots 20-180 seconds apart')
+    if not rankings:
+        reasons.append('No eligible contract candidates for the confirmed direction')
+    if rankings:
+        score, _, best, checks = rankings[0]
+        if score < min_score:
+            reasons.append(f'Option score {score}/6 below minimum {min_score}/6')
+        # Premium direction must actually improve between fresh snapshots.
+        if not checks['Premium rising vs recent snapshot']:
+            reasons.append('Option premium has not risen between recent snapshots')
+        if trading_window and recent_bar and comparison_valid and score >= min_score and checks['Premium rising vs recent snapshot']:
+            decision = f'{side} BUY CANDIDATE'
+    if decision == 'NO TRADE':
+        st.info('NO TRADE')
+        for reason in reasons:
+            st.write('• ' + reason)
     else:
-        st.session_state.previous = {}
-        st.session_state.previous_spot = None
-        st.session_state.previous_time = None
-
+        st.success(decision)
+        entry = best.ask if np.isfinite(best.ask) and best.ask > 0 else best.ltp
+        # Illustrative risk only; not ATR-derived option premium stops.
+        sl = max(0.05, entry * 0.88)
+        target = entry + (entry - sl) * rr
+        st.write(f'**Strike:** {best.strike:g} {side} | **Option score:** {score}/6')
+        st.write(f'**Illustrative entry:** ₹{entry:.2f} | **SL:** ₹{sl:.2f} | **Target:** ₹{target:.2f}')
+        st.warning('Entry/SL/target are illustrative premium levels, not validated execution signals.')
+    st.subheader('Top 3 option candidates in confirmed direction')
+    if rankings:
+        display = []
+        for score, _, row, checks in rankings[:3]:
+            display.append({'Strike': f'{row.strike:g} {row.side}', 'Score': f'{score}/6',
+                            'LTP': row.ltp, 'Delta': row.delta, 'IV': row.iv,
+                            'Spread %': row.spread_pct, 'Volume': row.volume,
+                            'OI': row.oi, 'OI vs prev close': row.oi_change_close,
+                            'Premium up': checks['Premium rising vs recent snapshot']})
+        st.dataframe(pd.DataFrame(display), hide_index=True, use_container_width=True)
+    else:
+        st.caption('No directional candidates while trend is unconfirmed.')
+    with st.expander('Full option chain and Greeks'):
+        st.dataframe(df.drop(columns=['instrument']), use_container_width=True, hide_index=True)
+        st.download_button('Download option chain CSV', df.to_csv(index=False), file_name='nifty_option_chain.csv', mime='text/csv')
+    st.caption('OI change shown vs previous close, not fresh OI buildup. A positive OI change does not prove buying/writing. PCR is contextual, not a standalone direction signal.')
+    if trading_window:
+        st.session_state.last_prices = {r.instrument: r.ltp for _, r in df.iterrows() if r.instrument and np.isfinite(r.ltp) and r.ltp > 0}
+        st.session_state.last_market_snapshot_at = now
 
 dashboard()
-
-st.caption(
-    "Source: Upstox Option Chain API v2. "
-    "Independent research dashboard. "
-    "No automatic broker orders."
-)
