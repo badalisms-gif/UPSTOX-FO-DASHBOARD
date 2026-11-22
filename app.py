@@ -1,4 +1,3 @@
-
 import os
 import gzip
 import json
@@ -49,6 +48,85 @@ def instruments():
         if key and symbol:
             rows.append({'symbol':str(symbol), 'name':str(x.get('name') or symbol), 'key':key})
     return pd.DataFrame(rows).drop_duplicates('key').sort_values('symbol')
+
+
+@st.cache_data(ttl=86400, show_spinner='Loading F&O universe...')
+def fo_universe():
+    r = requests.get(MASTER, timeout=45)
+    r.raise_for_status()
+    items = json.loads(gzip.decompress(r.content))
+    equities = {}
+    for x in items:
+        if x.get('segment') == 'NSE_EQ' and x.get('instrument_key'):
+            sym = str(x.get('trading_symbol') or x.get('tradingsymbol') or '').upper()
+            if sym:
+                equities[x['instrument_key']] = {'symbol':sym,'key':x['instrument_key']}
+    option_underlyings = set()
+    option_names = set()
+    for x in items:
+        if x.get('segment') != 'NSE_FO':
+            continue
+        typ = str(x.get('instrument_type') or '').upper()
+        if typ not in ('CE','PE'):
+            continue
+        ukey = x.get('underlying_key')
+        if ukey:
+            option_underlyings.add(ukey)
+        uname = str(x.get('name') or x.get('underlying_symbol') or '').upper()
+        if uname:
+            option_names.add(uname)
+    found = [v for k,v in equities.items() if k in option_underlyings or v['symbol'] in option_names]
+    if not found:
+        raise RuntimeError('F&O underlying mapping missing in instrument master. Scanner will not assume all equities are F&O.')
+    return pd.DataFrame(found).drop_duplicates('key').sort_values('symbol').reset_index(drop=True)
+
+
+def scan_quotes(token, universe):
+    # Snapshot scan: Upstox full quotes in batches, not a full 5-minute candle scan.
+    rows=[]; failures=[]
+    keys=universe.key.tolist()
+    for start in range(0,len(keys),40):
+        batch=keys[start:start+40]
+        try:
+            response=request_data('/v2/market-quote/quotes',token,{'instrument_key':','.join(batch)})
+            for item in response.values():
+                if not isinstance(item,dict):
+                    continue
+                key=item.get('instrument_token') or item.get('instrument_key')
+                if not key:
+                    continue
+                last=n(item.get('last_price'))
+                ohlc=item.get('ohlc') or {}
+                prev=n(ohlc.get('close'))
+                day_open=n(ohlc.get('open'))
+                high=n(ohlc.get('high'))
+                low=n(ohlc.get('low'))
+                volume=n(item.get('volume'),0)
+                if not (np.isfinite(last) and np.isfinite(prev) and prev>0):
+                    continue
+                pct=100*(last/prev-1)
+                range_pos=100*(last-low)/(high-low) if np.isfinite(high) and np.isfinite(low) and high>low else np.nan
+                open_pct=100*(last/day_open-1) if np.isfinite(day_open) and day_open>0 else np.nan
+                rows.append({'key':key,'LTP':last,'Change %':pct,'From Open %':open_pct,'Range Position %':range_pos,'Volume':volume})
+        except Exception as exc:
+            failures.append(str(exc)[:110])
+    if not rows:
+        raise RuntimeError('No usable quotes returned. '+('; '.join(failures[:2]) if failures else ''))
+    frame=pd.DataFrame(rows).drop_duplicates('key')
+    frame=universe.merge(frame,on='key',how='inner')
+    if frame.empty:
+        raise RuntimeError('Quote instrument keys did not match F&O underlying keys.')
+    # Transparent, snapshot-only momentum ranking; not a validated BUY signal.
+    frame['Direction']=np.where((frame['Change %']>0.35)&(frame['From Open %']>0), 'CE WATCH',
+                        np.where((frame['Change %']< -0.35)&(frame['From Open %']<0),'PE WATCH','NEUTRAL'))
+    strength=np.minimum(frame['Change %'].abs()/2.5,1)*60
+    position=np.where(frame.Direction=='CE WATCH',frame['Range Position %'],
+             np.where(frame.Direction=='PE WATCH',100-frame['Range Position %'],50))
+    frame['Score / 100']=(strength+np.clip(position,0,100)*0.4).clip(0,100).round(0).astype(int)
+    frame.loc[frame.Direction=='NEUTRAL','Score / 100']=0
+    frame=frame.sort_values(['Score / 100','Volume'],ascending=[False,False]).reset_index(drop=True)
+    frame.insert(0,'Rank',np.arange(1,len(frame)+1))
+    return frame,failures
 
 
 def contracts(token, key):
@@ -244,6 +322,38 @@ def dashboard():
     open_window=now.weekday()<5 and time(9,15)<=now.time()<=time(15,30)
     st.caption(f'Last fetch: {now:%d %b %Y %I:%M:%S %p} IST')
     if not open_window:st.warning('Outside regular NSE hours. Live BUY disabled; quotes may be stale.')
+    st.header('0. F&O STOCK OPPORTUNITY SCANNER')
+    st.caption('Snapshot momentum ranking from stock quotes, NOT confirmed 5-minute breakout or option BUY signals. Live data only during market hours.')
+    if st.button('Scan all available F&O stocks',key='scan_fo'):
+        try:
+            universe_fo=fo_universe()
+            with st.spinner(f'Scanning {len(universe_fo)} F&O underlyings...'):
+                ranking,errors=scan_quotes(token,universe_fo)
+            st.session_state['scanner_ranking']=ranking
+            st.session_state['scanner_time']=now
+            st.session_state['scanner_errors']=errors
+        except Exception as exc:
+            st.error(f'Scanner unavailable: {exc}')
+    ranking=st.session_state.get('scanner_ranking')
+    if ranking is not None and not ranking.empty:
+        scan_time=st.session_state.get('scanner_time')
+        st.caption(f'Snapshot time: {scan_time:%d %b %Y %I:%M:%S %p} IST | {len(ranking)} stocks with usable quotes')
+        if not open_window:st.warning('Market closed: ranking is historical/stale, not a live opportunity.')
+        if st.session_state.get('scanner_errors'):
+            st.warning(f"Some quote batches failed ({len(st.session_state['scanner_errors'])}); ranking may be incomplete.")
+        display=['Rank','symbol','Direction','Score / 100','LTP','Change %','From Open %','Range Position %','Volume']
+        st.subheader('Top 10 CE / PE Watchlist')
+        leaders=ranking[ranking.Direction!='NEUTRAL'].head(10)
+        st.dataframe(leaders[display],hide_index=True,use_container_width=True)
+        st.subheader('Full F&O Ranking')
+        filter_choice=st.selectbox('Ranking filter',['All','CE WATCH','PE WATCH','NEUTRAL'],key='rank_filter')
+        filtered=ranking if filter_choice=='All' else ranking[ranking.Direction==filter_choice]
+        st.dataframe(filtered[display],hide_index=True,use_container_width=True)
+        st.download_button('Download ranking CSV',ranking[display].to_csv(index=False),file_name='fo_scanner_ranking.csv',mime='text/csv')
+        st.info('To inspect a ranked stock option chain, select Stock Options and its symbol in the sidebar, then Fetch / Refresh Now.')
+    else:
+        st.info('Press Scan all available F&O stocks to create a ranking. The scan is manual to avoid unnecessary API requests.')
+    st.divider()
     st.header('1. OPTION CHAIN + GREEKS — INDEPENDENT')
     chain=pd.DataFrame(); ce=[];pe=[]
     try:
