@@ -11,10 +11,10 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from news_engine import assess_news
+from news_engine import assess_news, scan_news_market
 
 st.set_page_config(
-    page_title="NSE F&O PRO — ALL IN ONE",
+    page_title="NSE F&O PRO — ALL IN ONE V3",
     page_icon="📊",
     layout="wide"
 )
@@ -27,6 +27,11 @@ INDEXES = {
     "BANKNIFTY": "NSE_INDEX|Nifty Bank",
     "FINNIFTY": "NSE_INDEX|Nifty Fin Service"
 }
+
+MASTER = (
+    "https://assets.upstox.com/"
+    "market-quote/instruments/exchange/NSE.json.gz"
+)
 
 
 def now():
@@ -42,6 +47,7 @@ def n(x):
 
 
 def api(path, token, params=None):
+
     r = requests.get(
         API + path,
         params=params,
@@ -67,12 +73,8 @@ def api(path, token, params=None):
 
 @st.cache_data(ttl=86400)
 def master():
-    r = requests.get(
-        "https://assets.upstox.com/"
-        "market-quote/instruments/exchange/NSE.json.gz",
-        timeout=30
-    )
 
+    r = requests.get(MASTER, timeout=30)
     r.raise_for_status()
 
     return json.loads(
@@ -100,10 +102,25 @@ def instruments():
     }
 
 
+@st.cache_data(ttl=86400)
+def lot_sizes():
+
+    return {
+        x.get("instrument_key"): n(x.get("lot_size"))
+        for x in master()
+        if x.get("segment") == "NSE_FO"
+    }
+
+
+# =====================================
+# MARKET STATUS AND FRESHNESS
+# =====================================
+
 @st.cache_data(ttl=30, show_spinner=False)
 def exchange(token):
 
     try:
+
         d = api(
             "/v2/market/status/NSE",
             token
@@ -172,6 +189,18 @@ def fresh(q, seconds=180):
     )
 
 
+def recent(value, seconds):
+
+    t = stamp(value)
+
+    return (
+        pd.notna(t)
+        and -5 <= (
+            now() - t.to_pydatetime()
+        ).total_seconds() <= seconds
+    )
+
+
 def quotes(token, keys):
 
     out = {}
@@ -203,7 +232,6 @@ def quotes(token, keys):
 def ranking(token):
 
     m = instruments()
-
     rows = []
     errors = []
 
@@ -237,9 +265,9 @@ def ranking(token):
             ]
 
             if (
-                not all(np.isfinite(
+                not np.isfinite(
                     [p, prev, op, hi, lo]
-                ))
+                ).all()
                 or min(p, prev, op) <= 0
                 or hi <= lo
             ):
@@ -255,11 +283,9 @@ def ranking(token):
             side = "NEUTRAL"
 
             if ch > .35 and p > op and pos >= 60:
-
                 side = "CE"
 
             elif ch < -.35 and p < op and pos <= 40:
-
                 side = "PE"
 
             score = 0
@@ -319,13 +345,22 @@ def parse(d):
         except Exception:
             continue
 
-    return pd.DataFrame(
+    frame = pd.DataFrame(
         rows,
         columns=[
             "ts", "open", "high",
             "low", "close", "volume"
         ]
-    ).set_index("ts").sort_index()
+    )
+
+    if frame.empty:
+        return frame
+
+    return (
+        frame.drop_duplicates("ts")
+        .set_index("ts")
+        .sort_index()
+    )
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -403,7 +438,7 @@ def bars(d, m, cut):
 
 
 # =====================================
-# STEP 2: AUTOMATED TECHNICAL ANALYST
+# STEP 2: TECHNICAL INDICATORS
 # =====================================
 
 def indicators(d):
@@ -452,13 +487,11 @@ def indicators(d):
     dn = -d.low.diff()
 
     plus = np.where(
-        (up > dn) & (up > 0),
-        up, 0
+        (up > dn) & (up > 0), up, 0
     )
 
     minus = np.where(
-        (dn > up) & (dn > 0),
-        dn, 0
+        (dn > up) & (dn > 0), dn, 0
     )
 
     for name, arr in [
@@ -528,12 +561,17 @@ def technical(token, key):
         raise RuntimeError("Stale candle")
 
     today = b[b.index.date == cut.date()]
-
     opening = today.iloc[:3]
+
+    expected = [
+        time(9, 15),
+        time(9, 20),
+        time(9, 25)
+    ]
 
     if (
         len(opening) < 3
-        or opening.index[0].time() != time(9, 15)
+        or list(opening.index.time) != expected
     ):
 
         raise RuntimeError("Opening range missing")
@@ -541,11 +579,9 @@ def technical(token, key):
     side = "NEUTRAL"
 
     if a.close > a.ema9 > a.ema21:
-
         side = "CE"
 
     elif a.close < a.ema9 < a.ema21:
-
         side = "PE"
 
     s = 1 if side == "CE" else -1
@@ -615,6 +651,7 @@ def technical(token, key):
 
         "Candle quality": (
             body >= .35 * a.atr
+            and s * (a.close - a.open) > 0
             and (
                 closepos >= .7
                 if s == 1 else closepos <= .3
@@ -634,15 +671,24 @@ def technical(token, key):
         "ADX": round(a.adx, 2),
         "RVOL": round(a.rvol, 2),
         "VWAP": vwap,
+        "ATR": a.atr,
+        "EMA 9": a.ema9,
+        "EMA 21": a.ema21,
+        "EMA 50": a.ema50,
+        "DI Plus": a.plus,
+        "DI Minus": a.minus,
+        "Spot Close": a.close,
         "Opening High": opening.high.max(),
-        "Opening Low": opening.low.min()
+        "Opening Low": opening.low.min(),
+        "Breakout Level": level,
+        "Technical Candle": str(a.name)
     }
 
     return side, checks, metrics
 
 
 # =====================================
-# STEP 4: ADVANCED OPTION CHAIN
+# STEP 4: OPTION CHAIN AND GREEKS
 # =====================================
 
 def expiry(token, key):
@@ -687,7 +733,6 @@ def chain(token, key, exp):
         ]:
 
             o = x.get(field) or {}
-
             m = o.get("market_data") or {}
             g = o.get("option_greeks") or {}
 
@@ -723,10 +768,16 @@ def chain(token, key, exp):
                 }
             })
 
-    return (
-        pd.DataFrame(rows).dropna(subset=["Key"])
-        if rows else pd.DataFrame()
+    if not rows:
+        return pd.DataFrame()
+
+    c = pd.DataFrame(rows).dropna(subset=["Key"])
+
+    c["Daily OI Change"] = (
+        c.OI - c["Previous OI"]
     )
+
+    return c
 
 
 def summary(c):
@@ -765,20 +816,6 @@ def summary(c):
     return pcr, max_pain
 
 
-@st.cache_data(ttl=86400)
-def lot_sizes():
-
-    return {
-
-        x.get("instrument_key"):
-        n(x.get("lot_size"))
-
-        for x in master()
-
-        if x.get("segment") == "NSE_FO"
-    }
-
-
 # =====================================
 # SESSION STORAGE
 # =====================================
@@ -795,7 +832,11 @@ for k, v in {
     "last_scan": None,
     "coverage": "—",
     "cursor": 0,
+    "news_cursor": 0,
     "news": {},
+    "news_market": {},
+    "news_total": 0,
+    "news_last_scan": None,
     "scan_count": 0,
     "deep_scanned": set(),
     "session_date": now().date()
@@ -803,32 +844,51 @@ for k, v in {
 }.items():
 
     if k not in st.session_state:
-
         st.session_state[k] = v
 
 S = st.session_state
 
-if S.session_date != now().date():
 
+def reset_day():
+
+    if S.session_date == now().date():
+        return
+
+    for v in S.signals.values():
+
+        if v["Status"] == "ACTIVE":
+            v["Status"] = "SESSION ENDED / UNRESOLVED"
+
+    S.ranking = pd.DataFrame()
+    S.results = []
+    S.diagnostics = []
     S.snapshots = {}
     S.chains = {}
-    S.results = []
     S.news = {}
+    S.news_market = {}
     S.deep_scanned = set()
     S.cursor = 0
+    S.news_cursor = 0
+    S.news_total = 0
+    S.news_last_scan = None
+    S.last_scan = None
+    S.scan_count = 0
+    S.coverage = "—"
     S.session_date = now().date()
+
+
+reset_day()
 
 
 # =====================================
 # DASHBOARD SETTINGS
 # =====================================
 
-st.title("NSE F&O PRO — ALL IN ONE")
+st.title("NSE F&O PRO — ALL IN ONE V3")
 
 st.caption(
-    "Automatic News Intelligence | "
-    "Advanced Option Chain | "
-    "Research Signals"
+    "Momentum + News Scanner | "
+    "Technical Analysis | Option Intelligence"
 )
 
 with st.sidebar:
@@ -836,13 +896,10 @@ with st.sidebar:
     st.header("Upstox Connection")
 
     token = st.text_input(
-
         "Upstox Access Token",
-
         value=os.getenv(
             "UPSTOX_ACCESS_TOKEN", ""
         ),
-
         type="password"
     )
 
@@ -881,6 +938,8 @@ with st.sidebar:
         2.0, 4.0, 2.0, .25
     )
 
+    st.header("Option Filters")
+
     minvol = st.number_input(
         "Minimum option volume",
         min_value=100,
@@ -901,6 +960,28 @@ with st.sidebar:
     count = st.slider(
         "Deep scan per side per cycle",
         1, 20, 5
+    )
+
+    st.header("Advanced News Engine")
+
+    news_batch = st.slider(
+        "News stocks per cycle",
+        1, 20, 5
+    )
+
+    news_priority = st.slider(
+        "News priority stocks per cycle",
+        1, 10, 3
+    )
+
+    news_auto = st.toggle(
+        "Automatic market news scanning",
+        value=True
+    )
+
+    strict_news = st.toggle(
+        "Require Google and NSE news feeds",
+        value=True
     )
 
     auto = st.toggle(
@@ -939,36 +1020,254 @@ def budget():
 
 
 # =====================================
-# STEP 3: AUTOMATIC NEWS INTELLIGENCE
+# STEP 3: ADVANCED NEWS INTELLIGENCE
 # =====================================
 
 def automatic_news(symbol, side):
 
     try:
 
-        news = assess_news(
-            symbol,
-            side
+        result = dict(
+            assess_news(symbol, side)
         )
 
-    except Exception:
+    except Exception as e:
 
-        news = {
+        result = {
 
             "status": "NEWS UNVERIFIED",
             "block": False,
             "points": 0,
             "items": [],
+            "sources": {},
+            "errors": {"Engine": str(e)},
+            "complete": False,
             "checked": now().isoformat()
         }
 
-    news = dict(news)
+    result["direction"] = side
 
-    news["direction"] = side
+    S.news[symbol + "|" + side] = result
 
-    S.news[symbol] = news
+    return result
 
-    return news
+
+def news_feed_ok(result):
+
+    sources = result.get("sources", {})
+
+    if not strict_news:
+        return True
+
+    if result.get("symbol") in INDEXES:
+
+        return bool(
+            sources.get("Google News", False)
+        )
+
+    return bool(
+        sources.get("Google News", False)
+        and sources.get("NSE Announcements", False)
+    )
+
+
+def news_cycle():
+
+    symbols = sorted(
+        set(instruments().values())
+    )
+
+    S.news_total = len(symbols)
+
+    if not symbols:
+        return
+
+    result = scan_news_market(
+        symbols,
+        start=S.news_cursor,
+        batch_size=news_batch
+    )
+
+    for row in result.get("results", []):
+
+        S.news_market[row["Symbol"]] = row
+
+    S.news_cursor = result.get(
+        "next_cursor", 0
+    )
+
+    S.news_last_scan = now()
+
+
+def news_frame():
+
+    if not S.news_market:
+        return pd.DataFrame()
+
+    return pd.DataFrame(
+        list(S.news_market.values())
+    )
+
+
+def news_candidates(r):
+
+    candidates = []
+
+    if r.empty:
+        return candidates
+
+    lookup = {
+        row["Symbol"]: row
+        for row in r.to_dict("records")
+    }
+
+    for symbol, item in S.news_market.items():
+
+        direction = item.get(
+            "News Direction", ""
+        )
+
+        if direction not in (
+            "CE WATCH", "PE WATCH"
+        ):
+            continue
+
+        if not recent(
+            item.get("Checked"), 1800
+        ):
+            continue
+
+        row = lookup.get(symbol)
+
+        if not row or not row.get("Fresh"):
+            continue
+
+        side = direction.split()[0]
+
+        points = n(
+            item.get(side + " Points", 0)
+        )
+
+        candidates.append({
+
+            **row,
+
+            "Side": side,
+
+            "Origin": "NEWS",
+
+            "News Priority": (
+                points if np.isfinite(points)
+                else 0
+            )
+        })
+
+    candidates.sort(
+
+        key=lambda x: (
+            x["News Priority"],
+            x["Momentum Score"]
+        ),
+
+        reverse=True
+    )
+
+    return candidates[:news_priority]
+
+
+def show_news(result):
+
+    st.write(
+        "Direction:",
+        result.get("direction", "—")
+    )
+
+    st.write(
+        "News status:",
+        result.get("status", "UNVERIFIED")
+    )
+
+    st.write(
+        "News points:",
+        result.get("points", 0)
+    )
+
+    st.caption(
+        "Checked: "
+        + str(result.get("checked", "—"))
+    )
+
+    sources = result.get("sources", {})
+    errors = result.get("errors", {})
+
+    if sources:
+
+        cols = st.columns(2)
+
+        for i, (source, available) in enumerate(
+            sources.items()
+        ):
+
+            cols[i % 2].write(
+
+                ("✅ " if available else "⚠️ ")
+                + source
+                + (
+                    " — Available"
+                    if available
+                    else " — Unavailable"
+                )
+            )
+
+    if result.get("block"):
+
+        st.error(
+            "Adverse or mixed news detected."
+        )
+
+    if not result.get("complete", False):
+
+        st.warning(
+            "News source coverage is incomplete."
+        )
+
+    if not result.get("items"):
+
+        st.info(
+            "No matching headlines returned. "
+            "Check source availability above."
+        )
+
+    for item in result.get("items", []):
+
+        st.write(item.get("title", ""))
+
+        st.caption(
+
+            f"{item.get('source', '')} | "
+            f"{item.get('time', '')} | "
+            f"{item.get('event', '')} | "
+            f"{item.get('impact', '')}"
+        )
+
+        url = str(item.get("url", ""))
+
+        if url.startswith("https://"):
+
+            st.link_button(
+                "Read source",
+                url
+            )
+
+    failures = {
+        k: v for k, v in errors.items()
+        if v
+    }
+
+    if failures:
+
+        with st.expander("News source diagnostics"):
+            st.write(failures)
 
 
 # =====================================
@@ -976,8 +1275,8 @@ def automatic_news(symbol, side):
 # =====================================
 
 def option_setup(
-    o, t, checks, metrics,
-    c, exp, symbol, old
+    o, checks, metrics,
+    c, exp, symbol, old, news, origin
 ):
 
     q = quotes(
@@ -987,15 +1286,11 @@ def option_setup(
     if not fresh(q):
 
         raise RuntimeError(
-            "Option quote stale or timestamp missing"
+            "Option quote stale"
         )
 
     b = indicators(
-        bars(
-            raw(token, o.Key),
-            5,
-            now()
-        )
+        bars(raw(token, o.Key), 5, now())
     )
 
     if len(b) < 30:
@@ -1012,9 +1307,55 @@ def option_setup(
         > timedelta(minutes=10)
     ):
 
-        raise RuntimeError("Option candles stale")
+        raise RuntimeError(
+            "Option candles stale"
+        )
 
-    entry = float(o.Ask)
+    q = quotes(
+        token, [o.Key]
+    ).get(o.Key, {})
+
+    if not fresh(q):
+
+        raise RuntimeError(
+            "Final quote stale"
+        )
+
+    depth = q.get("depth") or {}
+
+    buys = depth.get("buy") or []
+    sells = depth.get("sell") or []
+
+    bid = n(
+        buys[0].get("price")
+        if buys else None
+    )
+
+    entry = n(
+        sells[0].get("price")
+        if sells else None
+    )
+
+    if not (
+        np.isfinite([bid, entry]).all()
+        and entry >= bid > 0
+    ):
+
+        raise RuntimeError(
+            "Live bid/ask unavailable"
+        )
+
+    live_spread = (
+        200 * (entry - bid)
+        / (entry + bid)
+    )
+
+    if live_spread > spread:
+
+        raise RuntimeError(
+            "Live spread too wide"
+        )
+
     atr = n(a.atr)
 
     if not np.isfinite(atr) or atr <= 0:
@@ -1082,10 +1423,7 @@ def option_setup(
     )
 
     sl = entry - risk
-
-    lot = n(
-        lot_sizes().get(o.Key)
-    )
+    lot = n(lot_sizes().get(o.Key))
 
     if (
         not np.isfinite(lot)
@@ -1094,7 +1432,9 @@ def option_setup(
         or risk / entry > .25
     ):
 
-        raise RuntimeError("Risk or lot invalid")
+        raise RuntimeError(
+            "Risk or lot invalid"
+        )
 
     lots = max(
         0,
@@ -1134,13 +1474,6 @@ def option_setup(
         and o.Vega >= 0
     )
 
-    oiok = bool(oi > 0)
-
-    volok = bool(
-        vol > 0
-        and a.rvol >= 1.1
-    )
-
     groups = {
 
         "Spot direction": all(
@@ -1151,9 +1484,11 @@ def option_setup(
 
         "Premium momentum": premium,
 
-        "Live OI": oiok,
+        "Live OI increase": bool(oi > 0),
 
-        "Fresh volume": volok,
+        "Fresh volume": bool(
+            vol > 0 and a.rvol >= 1.1
+        ),
 
         "Opposite OI observed": bool(
             np.isfinite(oppchange)
@@ -1174,58 +1509,56 @@ def option_setup(
 
     base_score = sum(
 
-        w
-
-        for w, v in zip(
+        w for w, v in zip(
             weights, groups.values()
         )
 
         if v
     )
 
-    safe = (
+    points = n(news.get("points", 0))
 
-        abs(entry - a.close) <= .5 * atr
-
-        and lots > 0
-
-        and entry_window(token)
-
-        and all(groups.values())
-    )
-
-    # AUTOMATIC NEWS INTEGRATION
-
-    news = automatic_news(
-        symbol,
-        o.Side
-    )
-
-    event = news["status"]
-
-    news_points = min(
-        10,
-        max(0, n(news["points"]))
+    news_points = (
+        min(10, max(0, points))
+        if np.isfinite(points) else 0
     )
 
     score = round(
-
-        base_score * .90
-
-        + news_points,
-
+        base_score * .90 + news_points,
         1
     )
 
+    news_ok = news_feed_ok(news)
+
+    safety = {
+
+        "Live spread": live_spread <= spread,
+
+        "Entry not extended": (
+            abs(entry - a.close) <= .5 * atr
+        ),
+
+        "Affordable position": lots > 0,
+
+        "Entry window": entry_window(token),
+
+        "News feed requirement": news_ok,
+
+        "News assessment recent": recent(
+            news.get("checked"), 300
+        ),
+
+        "No adverse headline detected":
+        not news.get("block", False)
+    }
+
     safe = (
 
-        safe
+        all(groups.values())
 
-        and not news["block"]
+        and all(safety.values())
 
         and score >= 90
-
-        and entry_window(token)
     )
 
     return {
@@ -1235,6 +1568,7 @@ def option_setup(
         "Side": o.Side,
         "Strike": o.Strike,
         "Expiry": exp,
+        "Origin": origin,
 
         "Score": score,
 
@@ -1273,7 +1607,13 @@ def option_setup(
             lots * lot * entry, 2
         ),
 
-        "Current Premium": o.LTP,
+        "Current Premium": n(
+            q.get("last_price")
+        ),
+
+        "Live Bid": bid,
+
+        "Live Ask": entry,
 
         "Delta": o.Delta,
 
@@ -1289,6 +1629,9 @@ def option_setup(
 
         "OI Change": oi,
 
+        "Daily OI Change":
+        o["Daily OI Change"],
+
         "Fresh Volume": vol,
 
         "Total Volume": o.Volume,
@@ -1301,21 +1644,28 @@ def option_setup(
 
         "Max Pain": pain,
 
-        "Spread %": o["Spread %"],
+        "Spread %": round(live_spread, 2),
 
-        "News Review": event,
+        "Premium RSI": a.rsi,
 
-        "News Checked": news["checked"],
+        "Premium ATR": atr,
+
+        "Premium RVOL": a.rvol,
+
+        "News Review": news.get("status"),
+
+        "News Checked": news.get("checked"),
 
         "Time": now().isoformat(),
 
         "Last Quote Check": now().isoformat(),
 
+        "News Snapshot": news,
+
         "Checks": {
             **checks,
             **groups,
-            "No adverse news detected":
-            not news["block"]
+            **safety
         },
 
         **metrics
@@ -1338,7 +1688,18 @@ def track():
         == now().date().isoformat()
     ]
 
-    if not active or not open_market(token):
+    if not active:
+        return
+
+    if not open_market(token):
+
+        if now().time() >= time(15, 30):
+
+            for v in active:
+
+                v["Status"] = (
+                    "SESSION ENDED / UNRESOLVED"
+                )
 
         return
 
@@ -1364,9 +1725,7 @@ def track():
         v["Observed P&L"] = round(
 
             (p - v["Entry"])
-
             * v["Lots"]
-
             * v["Lot Size"],
 
             2
@@ -1375,24 +1734,21 @@ def track():
         if p <= v["SL"]:
 
             v["Status"] = "SL OBSERVED"
-
             v["Exit Observation"] = p
 
         elif p >= v["Target"]:
 
             v["Status"] = "TARGET OBSERVED"
-
             v["Exit Observation"] = p
 
         elif now().time() >= time(15, 20):
 
             v["Status"] = "EOD OBSERVED"
-
             v["Exit Observation"] = p
 
 
 # =====================================
-# COMPLETE MARKET SCANNER
+# COMBINED MARKET SCANNER
 # =====================================
 
 def scan():
@@ -1407,7 +1763,7 @@ def scan():
 
     S.coverage = f"{len(r)}/{total}"
 
-    S.diagnostics = errors
+    S.diagnostics = list(errors)
 
     if (
 
@@ -1419,10 +1775,12 @@ def scan():
     ):
 
         S.last_scan = now()
-
         return
 
-    selected = []
+    selected = news_candidates(r)
+
+    # Preserve priority for strong momentum
+    # while rotating through other candidates.
 
     for side in ("CE", "PE"):
 
@@ -1431,17 +1789,35 @@ def scan():
             & r.Fresh
         ]
 
+        if z.empty:
+            continue
+
+        top = z.head(1)
+
+        pool = z.iloc[1:]
+
         start = (
-            S.cursor * count
-        ) % max(1, len(z))
+            S.cursor * max(1, count - 1)
+        ) % max(1, len(pool))
 
-        selected.extend(
+        rotated = pd.concat([
+            pool.iloc[start:],
+            pool.iloc[:start]
+        ])
 
-            pd.concat([
-                z.iloc[start:],
-                z.iloc[:start]
-            ]).head(count).to_dict("records")
-        )
+        chosen = pd.concat([
+            top,
+            rotated.head(max(0, count - 1))
+        ])
+
+        for row in chosen.to_dict("records"):
+
+            selected.append({
+
+                **row,
+
+                "Origin": "MOMENTUM"
+            })
 
     S.cursor += 1
 
@@ -1451,20 +1827,49 @@ def scan():
 
         "Key": v,
 
-        "Side": "AUTO"
+        "Side": "AUTO",
+
+        "Origin": "INDEX"
 
     } for k, v in INDEXES.items())
+
+    unique = {}
+
+    for row in selected:
+
+        key = row["Key"]
+
+        if key not in unique:
+
+            unique[key] = row
+
+        elif (
+            unique[key]["Side"]
+            != row["Side"]
+        ):
+
+            unique[key]["Side"] = "AUTO"
+
+            unique[key]["Origin"] = (
+                "NEWS + MOMENTUM"
+            )
+
+        else:
+
+            unique[key]["Origin"] = (
+                "NEWS + MOMENTUM"
+            )
+
+    selected = list(unique.values())
 
     progress = st.progress(0)
 
     for i, row in enumerate(selected):
 
         sym = row["Symbol"]
-
         key = row["Key"]
 
         if not entry_window(token):
-
             break
 
         try:
@@ -1543,6 +1948,20 @@ def scan():
                     "Failed: " + ", ".join(failed)
                 )
 
+            news = automatic_news(sym, side)
+
+            if news.get("block"):
+
+                raise RuntimeError(
+                    "Blocked by adverse news"
+                )
+
+            if not news_feed_ok(news):
+
+                raise RuntimeError(
+                    "Required news feeds unavailable"
+                )
+
             z = c[
 
                 (c.Side == side)
@@ -1575,9 +1994,7 @@ def scan():
             ]
 
             z["Distance"] = (
-
                 z.Delta.abs() - .55
-
             ).abs()
 
             if z.empty:
@@ -1607,20 +2024,14 @@ def scan():
                     v = option_setup(
 
                         o,
-
-                        side,
-
                         checks,
-
                         metrics,
-
                         c,
-
                         exp,
-
                         sym,
-
-                        old
+                        old,
+                        news,
+                        row["Origin"]
                     )
 
                     S.results.append(v)
@@ -1628,9 +2039,7 @@ def scan():
                     if v["Status"] == "QUALIFIED":
 
                         ident = (
-
                             now().date().isoformat()
-
                             + "|" + sym
                         )
 
@@ -1647,6 +2056,22 @@ def scan():
 
                         break
 
+                    failed = [
+
+                        k for k, passed
+                        in v["Checks"].items()
+
+                        if passed is not None
+                        and not bool(passed)
+                    ]
+
+                    S.diagnostics.append(
+
+                        f"{sym} {o.Strike:g} "
+                        f"{side}: "
+                        + ", ".join(failed)
+                    )
+
                 except Exception as e:
 
                     S.diagnostics.append(
@@ -1662,120 +2087,205 @@ def scan():
             )
 
         progress.progress(
-
             (i + 1) / len(selected)
         )
 
     progress.empty()
 
     S.last_scan = now()
-
     S.scan_count += 1
 
 
 # =====================================
-# MAIN DASHBOARD
-# QUALIFIED CALLS ALWAYS VISIBLE
+# DISPLAY HELPERS
 # =====================================
 
-@st.fragment(
-    run_every="120s" if auto else None
-)
-def dashboard():
+def flat_records(records):
 
-    status = (
-        exchange(token)
-        if token else "UNKNOWN"
+    return pd.DataFrame([
+
+        {
+            k: x
+            for k, x in v.items()
+            if k not in (
+                "Checks",
+                "News Snapshot",
+                "Key"
+            )
+        }
+
+        for v in records
+    ])
+
+
+def show_news_market():
+
+    st.header("News-Based Opportunities")
+
+    total = S.news_total
+
+    reviewed = len(S.news_market)
+
+    st.metric(
+
+        "News Stocks Attempted",
+
+        f"{reviewed}/{total}"
+        if total else "0"
     )
 
-    opened = bool(
-        token and open_market(token)
-    )
+    if total:
 
-    a, b, c = st.columns(3)
-
-    a.metric(
-
-        "Market",
-
-        "OPEN" if opened
-
-        else "CLOSED / UNVERIFIED"
-    )
-
-    b.metric(
-
-        "Quote Coverage",
-
-        S.coverage
-    )
-
-    c.metric(
-
-        "Remaining risk ₹",
-
-        max(0, daily - used)
-    )
-
-    d, e, f = st.columns(3)
-
-    d.metric(
-        "Deep Scanned Today",
-        len(S.deep_scanned)
-    )
-
-    e.metric(
-        "News Reviewed",
-        len(S.news)
-    )
-
-    f.metric(
-        "Scan Cycles",
-        S.scan_count
-    )
-
-    st.caption(
-
-        f"{now():%d-%m-%Y %H:%M:%S} IST"
-
-        f" | Exchange: {status}"
-    )
-
-    clicked = st.button(
-
-        "SCAN COMPLETE F&O MARKET",
-
-        type="primary"
-    )
-
-    if token and (
-
-        clicked or (auto and opened)
-    ):
-
-        try:
-
-            track()
-
-            with st.spinner(
-                "Scanning F&O market..."
-            ):
-
-                scan()
-
-        except Exception as e:
-
-            st.error(str(e))
-
-    if not token:
-
-        st.info(
-            "Enter Upstox Access Token"
+        st.progress(
+            min(reviewed / total, 1.0)
         )
 
-    st.header(
-        "🎯 Final Qualified Calls"
+    d = news_frame()
+
+    if d.empty:
+
+        st.info(
+            "Run a news scan to populate this section."
+        )
+
+        return
+
+    valid = d[
+        d["Checked"].apply(
+            lambda x: recent(x, 1800)
+        )
+    ] if "Checked" in d else d.iloc[:0]
+
+    st.caption(
+        "Priority watchlist uses assessments "
+        "from the last 30 minutes."
     )
+
+    left, right = st.columns(2)
+
+    for col, side in [
+
+        (left, "CE"),
+
+        (right, "PE")
+    ]:
+
+        col.subheader(
+            "NEWS " + side + " WATCH"
+        )
+
+        z = valid[
+            valid["News Direction"]
+            == side + " WATCH"
+        ]
+
+        if not z.empty:
+
+            cols = [
+
+                "Symbol",
+                "Company",
+                side + " Points",
+                "Headlines",
+                "Checked"
+            ]
+
+            col.dataframe(
+
+                z[
+                    [k for k in cols if k in z]
+                ].sort_values(
+                    side + " Points",
+                    ascending=False
+                ),
+
+                hide_index=True,
+
+                use_container_width=True
+            )
+
+        else:
+
+            col.info(
+                "No recent aligned news candidate."
+            )
+
+    st.subheader("News Source Coverage")
+
+    sources = [
+
+        "Google News",
+
+        "NSE Announcements",
+
+        "NSE Bulk Deals",
+
+        "NSE Block Deals"
+    ]
+
+    source_rows = []
+
+    for source in sources:
+
+        available = 0
+        unavailable = 0
+        unknown = 0
+
+        for item in S.news_market.values():
+
+            status = item.get(
+                "Sources", {}
+            ).get(source)
+
+            if status is True:
+                available += 1
+
+            elif status is False:
+                unavailable += 1
+
+            else:
+                unknown += 1
+
+        source_rows.append({
+
+            "Source": source,
+
+            "Available checks": available,
+
+            "Unavailable checks": unavailable,
+
+            "Unknown": unknown
+        })
+
+    st.dataframe(
+
+        pd.DataFrame(source_rows),
+
+        hide_index=True,
+
+        use_container_width=True
+    )
+
+    if S.news_last_scan:
+
+        st.caption(
+
+            "Last news batch: "
+
+            + S.news_last_scan.strftime(
+                "%H:%M:%S IST"
+            )
+        )
+
+
+# =====================================
+# FINAL QUALIFIED CALLS
+# ALWAYS VISIBLE
+# =====================================
+
+def show_calls(opened):
+
+    st.header("🎯 Final Qualified Calls")
 
     active = [
 
@@ -1787,9 +2297,7 @@ def dashboard():
         == now().date().isoformat()
     ]
 
-    active = sorted(
-
-        active,
+    active.sort(
 
         key=lambda v: v["Score"],
 
@@ -1799,22 +2307,11 @@ def dashboard():
     if not active:
 
         st.info(
-
             "NO TRADE / WAIT — "
-
             "No fully confirmed setup"
         )
 
-    if active and not opened:
-
-        st.warning(
-
-            "Market closed or unverified. "
-
-            "Displayed signals are historical "
-
-            "observations, not fresh entries."
-        )
+        return
 
     for v in active:
 
@@ -1831,10 +2328,44 @@ def dashboard():
 
             st.caption(
 
-                f"Research signal | {v['Time']}"
+                f"Origin: {v.get('Origin', '—')} | "
 
-                f" | Score {v['Score']}/100"
+                f"Signal time: {v['Time']} | "
+
+                f"Score: {v['Score']}/100"
             )
+
+            fresh_signal = (
+
+                opened
+
+                and entry_window(token)
+
+                and recent(
+                    v["Time"], 180
+                )
+
+                and recent(
+                    v["Last Quote Check"], 180
+                )
+
+                and v["Planned Risk"] <= budget()
+
+                and v["Capital"] <= capital
+            )
+
+            if fresh_signal:
+
+                st.success(
+                    "RECENT QUALIFIED RESEARCH SIGNAL"
+                )
+
+            else:
+
+                st.warning(
+                    "TRACKING ONLY — "
+                    "Not a fresh entry recommendation"
+                )
 
             cols = st.columns(3)
 
@@ -1850,31 +2381,31 @@ def dashboard():
 
                 "Target 2",
 
-                "Lots"
+                "Lots",
+
+                "Planned Risk",
+
+                "Capital",
+
+                "Observed P&L"
             ]):
 
                 cols[i % 3].metric(
 
-                    k, v[k]
+                    k,
+
+                    v.get(k, "—")
                 )
 
             st.progress(
-
                 min(v["Score"] / 100, 1.0)
             )
 
             if v["Current Premium"] > v["Entry"]:
 
-                st.caption(
-                    "Premium above original entry. "
-                    "Do not assume entry is still available."
-                )
-
-            if v["Planned Risk"] > budget():
-
                 st.warning(
-                    "Original setup exceeds current "
-                    "remaining risk budget."
+                    "Premium above original entry. "
+                    "Do not chase."
                 )
 
             st.subheader(
@@ -1889,7 +2420,9 @@ def dashboard():
 
                 if k not in (
 
-                    "Checks", "Key"
+                    "Checks",
+                    "Key",
+                    "News Snapshot"
                 )
             }
 
@@ -1912,7 +2445,7 @@ def dashboard():
             )
 
             st.subheader(
-                "Signal Confirmation"
+                "Technical & Option Confirmation"
             )
 
             for name, passed in v["Checks"].items():
@@ -1925,129 +2458,229 @@ def dashboard():
 
                 elif bool(passed):
 
-                    st.write(
-                        f"✅ {name}"
-                    )
+                    st.write(f"✅ {name}")
 
                 else:
 
-                    st.write(
-                        f"❌ {name}"
-                    )
+                    st.write(f"❌ {name}")
 
             st.subheader(
-                "News Intelligence"
+                "News Intelligence at Signal Time"
             )
 
-            news = S.news.get(
-                v["Symbol"], {}
+            show_news(
+                v.get("News Snapshot", {})
             )
-
-            if isinstance(news, dict):
-
-                st.write(
-
-                    "News Status:",
-
-                    news.get(
-                        "status",
-                        "NEWS UNVERIFIED"
-                    )
-                )
-
-                st.write(
-
-                    "News Points:",
-
-                    news.get("points", 0)
-                )
-
-                for item in news.get(
-                    "items", []
-                ):
-
-                    st.write(
-                        item["title"]
-                    )
-
-                    st.caption(
-
-                        f"{item['source']} | "
-
-                        f"{item['time']}"
-                    )
-
-                    if item.get(
-                        "url", ""
-                    ).startswith("https://"):
-
-                        st.markdown(
-
-                            f"[Read News]({item['url']})"
-                        )
 
             st.warning(
 
-                "Research signal, not an executed trade. "
+                "Research observation only. "
 
-                "Recheck live bid/ask before entry. "
+                "Recheck executable bid/ask. "
 
-                "Calls are alternatives, not simultaneous "
+                "Signals are alternatives, "
 
-                "positions."
+                "not simultaneous positions."
             )
+
+
+# =====================================
+# MAIN DASHBOARD
+# =====================================
+
+@st.fragment(
+    run_every="120s" if auto else None
+)
+def dashboard():
+
+    reset_day()
+
+    status = (
+        exchange(token)
+        if token else "UNKNOWN"
+    )
+
+    opened = bool(
+        token and open_market(token)
+    )
+
+    a, b, c = st.columns(3)
+
+    a.metric(
+
+        "Market",
+
+        "OPEN" if opened
+
+        else "CLOSED / UNVERIFIED"
+    )
+
+    b.metric(
+        "Quote Coverage",
+        S.coverage
+    )
+
+    c.metric(
+        "Remaining risk ₹",
+        max(0, daily - used)
+    )
+
+    d, e, f = st.columns(3)
+
+    d.metric(
+        "Deep Scanned Today",
+        len(S.deep_scanned)
+    )
+
+    e.metric(
+        "News Stocks Attempted",
+        len(S.news_market)
+    )
+
+    f.metric(
+        "Scan Cycles",
+        S.scan_count
+    )
+
+    st.caption(
+
+        f"{now():%d-%m-%Y %H:%M:%S} IST"
+
+        f" | Exchange: {status}"
+    )
+
+    left, right = st.columns(2)
+
+    clicked = left.button(
+
+        "SCAN COMPLETE F&O MARKET",
+
+        type="primary"
+    )
+
+    news_clicked = right.button(
+
+        "SCAN NEXT NEWS BATCH"
+    )
+
+    # Track existing research signals first.
+
+    if token and (
+        clicked or (auto and opened)
+    ):
+
+        try:
+            track()
+        except Exception as e:
+            st.warning(
+                f"Tracking unavailable: {e}"
+            )
+
+    # Independent news scanner.
+    # Manual news scanning also works on holidays.
+
+    if news_clicked or (
+
+        news_auto
+
+        and (
+            clicked
+            or (auto and opened)
+        )
+    ):
+
+        try:
+
+            with st.spinner(
+                "Scanning news batch..."
+            ):
+
+                news_cycle()
+
+        except Exception as e:
+
+            st.warning(
+                f"News scan unavailable: {e}"
+            )
+
+    # Main market scanner.
+
+    if token and (
+
+        clicked or (auto and opened)
+    ):
+
+        try:
+
+            with st.spinner(
+                "Scanning F&O market..."
+            ):
+
+                scan()
+
+        except Exception as e:
+
+            st.error(str(e))
+
+    if not token:
+
+        st.info(
+            "Enter Upstox Access Token"
+        )
+
+    # Qualified calls remain above every page.
+
+    show_calls(opened)
 
     if S.last_scan:
 
         st.caption(
 
-            f"Last completed scan: "
+            "Last completed scan: "
 
-            f"{S.last_scan:%H:%M:%S} IST"
+            + S.last_scan.strftime(
+                "%H:%M:%S IST"
+            )
         )
 
-        if (
-
-            now() - S.last_scan
-
-        ).total_seconds() > 180:
+        if not recent(
+            S.last_scan.isoformat(), 180
+        ):
 
             st.warning(
-
-                "Scan snapshot is stale. "
-
-                "Do not use as a fresh entry."
+                "Market scan snapshot is stale."
             )
 
     if not opened:
 
         st.warning(
 
-            "No new calls while exchange is closed "
+            "No new qualified calls while "
 
-            "or market status cannot be verified."
+            "exchange is closed or unverified."
         )
 
     st.divider()
 
     # =================================
-    # MARKET WATCHLIST
+    # HOME AND MARKET SCANNER
     # =================================
 
     if page in (
-
-        "Home",
-
-        "Market Scanner"
+        "Home", "Market Scanner"
     ):
+
+        st.header(
+            "Momentum Opportunities"
+        )
 
         r = S.ranking
 
         if not opened:
 
             st.info(
-
-                "Watchlist may contain previous-session data."
+                "Watchlist may contain "
+                "previous-session data."
             )
 
         if not r.empty:
@@ -2062,7 +2695,6 @@ def dashboard():
             ]:
 
                 col.subheader(
-
                     "TOP 10 " + side
                 )
 
@@ -2082,7 +2714,6 @@ def dashboard():
             if page == "Market Scanner":
 
                 st.header(
-
                     "Full F&O Market Ranking"
                 )
 
@@ -2095,55 +2726,105 @@ def dashboard():
                     use_container_width=True
                 )
 
+        show_news_market()
+
     # =================================
-    # DEEP TECHNICAL ANALYSIS
+    # DEEP ANALYSIS
     # =================================
 
     if page == "Deep Analysis":
 
         st.header(
-
             "Deep Technical Analysis"
         )
 
-        st.dataframe(
+        if S.results:
 
-            pd.DataFrame([
+            st.dataframe(
 
-                {
+                flat_records(S.results),
 
-                    k: x
+                use_container_width=True
+            )
 
-                    for k, x in v.items()
+            st.download_button(
 
-                    if k != "Checks"
-                }
+                "Download Analysis CSV",
 
-                for v in S.results
+                flat_records(
+                    S.results
+                ).to_csv(index=False),
 
-            ]),
+                "deep_analysis.csv"
+            )
 
-            use_container_width=True
-        )
+        else:
+
+            st.info(
+                "No option setups in latest cycle."
+            )
 
         st.write(S.diagnostics)
 
     # =================================
-    # OPTION CHAIN AND GREEKS
+    # OPTION CHAIN
     # =================================
 
     if page == "Option Chain & Greeks":
 
         st.header(
-
             "Advanced Option Chain"
         )
+
+        if token:
+
+            mapping = {
+                v: k
+                for k, v in instruments().items()
+            }
+
+            mapping.update(INDEXES)
+
+            symbol = st.selectbox(
+
+                "Select underlying",
+
+                sorted(mapping)
+            )
+
+            if st.button("FETCH OPTION CHAIN"):
+
+                try:
+
+                    key = mapping[symbol]
+
+                    exp = expiry(token, key)
+
+                    if not exp:
+
+                        raise RuntimeError(
+                            "No eligible expiry"
+                        )
+
+                    c = chain(token, key, exp)
+
+                    if c.empty:
+
+                        raise RuntimeError(
+                            "Empty chain"
+                        )
+
+                    S.chains[symbol] = c
+
+                except Exception as e:
+
+                    st.error(str(e))
 
         if not S.chains:
 
             st.info(
-                "Option chain snapshots will appear "
-                "after live scanning."
+                "Option chain snapshots will "
+                "appear after scanning."
             )
 
         for sym, c in S.chains.items():
@@ -2155,17 +2836,16 @@ def dashboard():
                 a, b = st.columns(2)
 
                 a.metric(
-
-                    "PCR",
-
-                    round(pcr, 2)
+                    "PCR", round(pcr, 2)
                 )
 
                 b.metric(
+                    "Max Pain", pain
+                )
 
-                    "Max Pain",
-
-                    pain
+                st.caption(
+                    "Snapshot data. PCR and max pain "
+                    "are contextual, not entry signals."
                 )
 
                 st.dataframe(
@@ -2178,29 +2858,149 @@ def dashboard():
                 )
 
     # =================================
+    # NEWS AND EVENTS
+    # =================================
+
+    if page == "News & Events":
+
+        show_news_market()
+
+        st.header(
+            "Automatic News Intelligence"
+        )
+
+        st.caption(
+
+            "Google News | NSE Announcements | "
+
+            "Bulk Deals | Block Deals"
+        )
+
+        st.info(
+
+            "48-hour headlines and recent deals. "
+
+            "Headline classification is rule-based."
+        )
+
+        try:
+
+            syms = sorted(
+
+                set(instruments().values())
+
+                | set(INDEXES)
+            )
+
+            sym = st.selectbox(
+                "Select Stock",
+                syms
+            )
+
+            direction = st.selectbox(
+
+                "Assess Direction",
+
+                ["CE", "PE"]
+            )
+
+            if st.button(
+                "FETCH LATEST NEWS"
+            ):
+
+                with st.spinner(
+                    "Fetching recent news..."
+                ):
+
+                    automatic_news(
+                        sym, direction
+                    )
+
+        except Exception as e:
+
+            st.error(str(e))
+
+        st.markdown(
+
+            "[NSE Corporate Announcements]"
+
+            "(https://www.nseindia.com/"
+
+            "companies-listing/"
+
+            "corporate-filings-announcements)"
+        )
+
+        st.markdown(
+
+            "[NSE Bulk and Block Deals]"
+
+            "(https://www.nseindia.com/"
+
+            "report-detail/"
+
+            "display-bulk-and-block-deals)"
+        )
+
+        d = news_frame()
+
+        if not d.empty:
+
+            st.subheader(
+                "Full Market News Scan"
+            )
+
+            display = d.drop(
+                columns=["Sources"],
+                errors="ignore"
+            )
+
+            st.dataframe(
+
+                display,
+
+                hide_index=True,
+
+                use_container_width=True
+            )
+
+            st.download_button(
+
+                "Download News Scan",
+
+                display.to_csv(index=False),
+
+                "market_news.csv"
+            )
+
+        for ident, result in list(
+            S.news.items()
+        ):
+
+            with st.expander(
+
+                f"{ident} | "
+
+                f"{result.get('status', '—')}",
+
+                expanded=False
+            ):
+
+                show_news(result)
+
+    # =================================
     # SIGNAL HISTORY
     # =================================
 
     if page == "Signal History":
 
         st.header(
-
             "Signal History & Tracking"
         )
 
-        d = pd.DataFrame([
-
-            {
-
-                k: x
-
-                for k, x in v.items()
-
-                if k != "Checks"
-            }
-
-            for v in S.signals.values()
-        ])
+        d = flat_records(
+            S.signals.values()
+        )
 
         if not d.empty:
 
@@ -2227,22 +3027,20 @@ def dashboard():
             )
 
     with st.expander(
-
         "Rejected Setups / Diagnostics"
     ):
 
-        st.write(
-
-            S.diagnostics
-        )
+        st.write(S.diagnostics)
 
     st.caption(
 
         "Scores are rule-based, not win probabilities. "
 
-        "Deep scan rotates candidates. "
+        "Full quote coverage does not mean "
 
-        "Full quote coverage is not full technical coverage."
+        "full technical or news coverage. "
+
+        "Scan cycles may exceed 120 seconds."
     )
 
 
@@ -2250,241 +3048,27 @@ dashboard()
 
 
 # =====================================
-# AUTOMATIC NEWS AND EVENTS PAGE
-# =====================================
-
-if page == "News & Events":
-
-    st.header(
-
-        "Automatic News Intelligence"
-    )
-
-    st.caption(
-
-        "Google News RSS | "
-
-        "48-hour headlines | "
-
-        "5-minute cache"
-    )
-
-    st.success(
-
-        "Automatic news engine connected. "
-
-        "Manual CLEAR is no longer required."
-    )
-
-    st.info(
-
-        "Aligned headlines can earn 10 points. "
-
-        "Adverse or mixed headlines can block a setup. "
-
-        "Unverified news earns zero points."
-    )
-
-    st.warning(
-
-        "Headline classification is keyword-based. "
-
-        "It does not verify every corporate event "
-
-        "or guarantee the direction of a stock."
-    )
-
-    st.markdown(
-
-        "[NSE Corporate Announcements]"
-
-        "(https://www.nseindia.com/"
-
-        "companies-listing/"
-
-        "corporate-filings-announcements)"
-    )
-
-    if token:
-
-        try:
-
-            syms = sorted(
-
-                set(instruments().values())
-
-                | set(INDEXES)
-            )
-
-            sym = st.selectbox(
-
-                "Select Stock",
-
-                syms
-            )
-
-            direction = st.selectbox(
-
-                "Assess Direction",
-
-                ["CE", "PE"]
-            )
-
-            if st.button(
-
-                "FETCH LATEST NEWS",
-
-                type="primary"
-            ):
-
-                with st.spinner(
-
-                    "Fetching recent news..."
-                ):
-
-                    automatic_news(
-
-                        sym,
-
-                        direction
-                    )
-
-        except Exception as e:
-
-            st.error(str(e))
-
-    st.metric(
-
-        "Stocks Reviewed This Session",
-
-        len(S.news)
-    )
-
-    if not S.news:
-
-        st.info(
-
-            "Automatic news results will appear "
-
-            "when candidates reach option setup analysis. "
-
-            "You can also fetch news manually for testing."
-        )
-
-    for symbol, result in list(S.news.items()):
-
-        if not isinstance(result, dict):
-
-            continue
-
-        with st.expander(
-
-            f"{symbol} | {result['status']}",
-
-            expanded=True
-        ):
-
-            st.write(
-
-                "Direction:",
-
-                result.get("direction", "—")
-            )
-
-            st.write(
-
-                "News Status:",
-
-                result["status"]
-            )
-
-            st.write(
-
-                "News Points:",
-
-                result["points"]
-            )
-
-            st.write(
-
-                "Checked:",
-
-                result["checked"]
-            )
-
-            if result["block"]:
-
-                st.error(
-
-                    "Adverse or mixed headline detected."
-                )
-
-            if not result["items"]:
-
-                st.info(
-
-                    "No matching recent headlines "
-
-                    "or news feed unavailable."
-                )
-
-            for item in result["items"]:
-
-                st.write(
-
-                    item["title"]
-                )
-
-                st.caption(
-
-                    f"{item['source']} | "
-
-                    f"{item['time']}"
-                )
-
-                if item.get(
-
-                    "url", ""
-
-                ).startswith("https://"):
-
-                    st.markdown(
-
-                        f"[Read Full News]({item['url']})"
-                    )
-
-
-# =====================================
-# STEP 7: BACKTESTING
+# STEP 7: FORWARD TESTING
 # =====================================
 
 if page == "Backtesting":
 
     st.header(
-
-        "Strategy Backtesting"
-    )
-
-    st.info(
-
-        "Full historical options backtesting requires "
-
-        "timestamped option chain, OI, Greeks, bid/ask "
-
-        "and news data."
+        "Strategy Testing"
     )
 
     st.warning(
 
-        "Historical options backtesting is not yet "
+        "Full historical options backtesting "
 
-        "implemented. Current snapshots cannot "
+        "is not implemented. Historical OI, "
 
-        "reconstruct historical option-chain conditions."
+        "Greeks, bid/ask and news snapshots "
+
+        "are required."
     )
 
     st.subheader(
-
         "Forward Signal Observations"
     )
 
@@ -2504,7 +3088,7 @@ if page == "Backtesting":
 
     if observations:
 
-        df = pd.DataFrame(observations)
+        df = flat_records(observations)
 
         targets = sum(
 
@@ -2545,29 +3129,32 @@ if page == "Backtesting":
 
         st.dataframe(
 
-            df.drop(
-
-                columns=["Checks", "Key"],
-
-                errors="ignore"
-            ),
+            df,
 
             use_container_width=True
         )
 
+        st.download_button(
+
+            "Download Forward Observations",
+
+            df.to_csv(index=False),
+
+            "forward_observations.csv"
+        )
+
         st.caption(
 
-            "These are sampled price observations, "
+            "Sampled prices, not executed trades. "
 
-            "not historical backtest results or executed trades. "
+            "Intraperiod SL or target touches "
 
-            "Intraperiod target/SL touches may be missed."
+            "may be missed."
         )
 
     else:
 
         st.info(
-
             "No completed forward observations yet."
         )
 
@@ -2579,59 +3166,45 @@ if page == "Backtesting":
 if page == "Trading Journal":
 
     st.header(
-
         "Trading Journal"
     )
 
     with st.form("journal"):
 
         sym = st.text_input(
-
             "Stock / Option Contract"
         )
 
         side = st.selectbox(
-
             "Side",
-
             ["CE", "PE"]
         )
 
         en = st.number_input(
-
             "Entry",
-
             min_value=0.0
         )
 
         ex = st.number_input(
-
             "Exit",
-
             min_value=0.0
         )
 
         qty = st.number_input(
-
             "Quantity",
-
             min_value=1
         )
 
         charges = st.number_input(
-
             "Charges",
-
             min_value=0.0
         )
 
         notes = st.text_area(
-
             "Trade Notes"
         )
 
         submitted = st.form_submit_button(
-
             "Save Trade"
         )
 
@@ -2665,10 +3238,7 @@ if page == "Trading Journal":
 
     if S.journal:
 
-        d = pd.DataFrame(
-
-            S.journal
-        )
+        d = pd.DataFrame(S.journal)
 
         p = d["Net P&L"]
 
@@ -2676,7 +3246,7 @@ if page == "Trading Journal":
 
         a.metric(
 
-            "Net P&L",
+            "Net P&L ₹",
 
             round(p.sum(), 2)
         )
@@ -2695,9 +3265,7 @@ if page == "Trading Journal":
             "Profit Factor",
 
             round(
-
                 p[p > 0].sum() / loss,
-
                 2
             )
 
@@ -2725,13 +3293,13 @@ st.divider()
 
 st.caption(
 
-    "NSE F&O PRO — ALL IN ONE | "
+    "NSE F&O PRO — ALL IN ONE V3 | "
 
-    "Automatic News Intelligence | "
+    "Advanced News Intelligence | "
 
     "Session-only storage | "
 
-    "Auto scan requires an active Streamlit session | "
+    "Active Streamlit session required | "
 
     "No automatic real orders | "
 
