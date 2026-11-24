@@ -2,7 +2,8 @@
 import os
 import gzip
 import json
-from datetime import datetime, time, timedelta
+import math
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
 
@@ -12,18 +13,13 @@ import requests
 import streamlit as st
 
 st.set_page_config(
-    page_title="NSE F&O PRO V2",
+    page_title="NSE F&O PRO — ALL IN ONE",
     page_icon="📊",
     layout="wide"
 )
 
 IST = ZoneInfo("Asia/Kolkata")
 API = "https://api.upstox.com"
-
-MASTER = (
-    "https://assets.upstox.com/"
-    "market-quote/instruments/exchange/NSE.json.gz"
-)
 
 INDEXES = {
     "NIFTY": "NSE_INDEX|Nifty 50",
@@ -32,272 +28,330 @@ INDEXES = {
 }
 
 
-def num(x, default=np.nan):
+def now():
+    return datetime.now(IST)
+
+
+def n(x):
     try:
-        x = float(x)
-        return x if np.isfinite(x) else default
+        v = float(x)
+        return v if np.isfinite(v) else np.nan
     except (ValueError, TypeError):
-        return default
+        return np.nan
 
 
 def api(path, token, params=None):
-    response = requests.get(
+    r = requests.get(
         API + path,
         params=params,
         headers={
-            "Authorization": f"Bearer {token}",
+            "Authorization": "Bearer " + token,
             "Accept": "application/json"
         },
-        timeout=20
+        timeout=15
     )
 
-    if not response.ok:
+    if not r.ok:
         raise RuntimeError(
-            f"Upstox HTTP {response.status_code}"
+            f"Upstox HTTP {r.status_code}"
         )
 
-    payload = response.json()
+    p = r.json()
 
-    if payload.get("status") != "success":
+    if p.get("status") != "success":
         raise RuntimeError("Upstox API error")
 
-    return payload.get("data")
+    return p.get("data")
 
 
 @st.cache_data(ttl=86400)
 def master():
-    r = requests.get(MASTER, timeout=40)
+    r = requests.get(
+        "https://assets.upstox.com/"
+        "market-quote/instruments/exchange/NSE.json.gz",
+        timeout=30
+    )
+
     r.raise_for_status()
-    return json.loads(gzip.decompress(r.content))
+
+    return json.loads(
+        gzip.decompress(r.content)
+    )
 
 
-@st.cache_data(ttl=86400)
-def universe():
-    items = master()
+@st.cache_data(ttl=3600)
+def instruments():
+    m = master()
 
-    underlying = {
+    u = {
         x.get("underlying_key")
-        for x in items
+        for x in m
         if x.get("segment") == "NSE_FO"
         and x.get("instrument_type") in ("CE", "PE")
     }
 
-    rows = []
-
-    for x in items:
-        if (
-            x.get("segment") == "NSE_EQ"
-            and x.get("instrument_key") in underlying
-        ):
-            rows.append({
-                "symbol": x.get("trading_symbol"),
-                "key": x.get("instrument_key")
-            })
-
-    return pd.DataFrame(rows).drop_duplicates("key")
+    return {
+        x["instrument_key"]: x["trading_symbol"]
+        for x in m
+        if x.get("segment") == "NSE_EQ"
+        and x.get("instrument_key") in u
+    }
 
 
-def market_open(now):
+@st.cache_data(ttl=30, show_spinner=False)
+def exchange(_token):
+    try:
+        d = api("/v2/market/status/NSE", _token)
+        return str(
+            d.get("status", "UNKNOWN")
+        ).upper()
+
+    except Exception:
+        return "UNKNOWN"
+
+
+def open_market(token):
+    t = now()
+
     return (
-        now.weekday() < 5
-        and time(9, 15) <= now.time() < time(15, 30)
+        t.weekday() < 5
+        and time(9, 15) <= t.time() < time(15, 30)
+        and exchange(token) == "NORMAL_OPEN"
     )
 
 
-def entry_window(now):
+def entry_window(token):
     return (
-        market_open(now)
-        and time(9, 30) <= now.time() <= time(14, 45)
+        open_market(token)
+        and time(9, 30) <= now().time() <= time(14, 45)
     )
 
 
-def scan_market(token):
-    stocks = universe()
+def stamp(x):
+    try:
+        if isinstance(x, (int, float)) or str(x).isdigit():
+            return pd.to_datetime(
+                float(x),
+                unit="ms",
+                utc=True
+            ).tz_convert(IST)
 
-    if stocks.empty:
-        raise RuntimeError("F&O universe unavailable")
+        return pd.to_datetime(
+            x, utc=True
+        ).tz_convert(IST)
 
-    mapping = dict(zip(stocks.key, stocks.symbol))
-    keys = list(mapping)
+    except Exception:
+        return pd.NaT
+
+
+def fresh(q, seconds=180):
+    t = stamp(
+        q.get("last_trade_time")
+        or q.get("timestamp")
+    )
+
+    return (
+        pd.notna(t)
+        and t.date() == now().date()
+        and -5 <= (
+            now() - t.to_pydatetime()
+        ).total_seconds() <= seconds
+    )
+
+
+def quotes(token, keys):
+    out = {}
+
+    for i in range(0, len(keys), 40):
+        d = api(
+            "/v2/market-quote/quotes",
+            token,
+            {
+                "instrument_key":
+                ",".join(keys[i:i + 40])
+            }
+        )
+
+        for q in (d or {}).values():
+            out[q.get("instrument_token")] = q
+
+    return out
+
+
+# =====================================
+# STEP 1: TRADING IDEAS GENERATOR
+# =====================================
+
+def ranking(token):
+    m = instruments()
+
     rows = []
     errors = []
 
-    for start in range(0, len(keys), 40):
-        batch = keys[start:start + 40]
-
+    for i in range(0, len(m), 40):
         try:
-            data = api(
-                "/v2/market-quote/quotes",
+            data = quotes(
                 token,
-                {"instrument_key": ",".join(batch)}
+                list(m)[i:i + 40]
             )
-
-            for q in (data or {}).values():
-                key = q.get("instrument_token")
-                ltp = num(q.get("last_price"))
-                net = num(q.get("net_change"))
-                ohlc = q.get("ohlc") or {}
-
-                if not isinstance(ohlc, dict):
-                    continue
-
-                op = num(ohlc.get("open"))
-                hi = num(ohlc.get("high"))
-                lo = num(ohlc.get("low"))
-                prev = ltp - net
-
-                if key not in mapping:
-                    continue
-
-                if not all(
-                    np.isfinite(v)
-                    for v in [ltp, prev, op, hi, lo]
-                ):
-                    continue
-
-                if min(prev, op, ltp) <= 0 or hi <= lo:
-                    continue
-
-                change = 100 * (ltp / prev - 1)
-                opening = 100 * (ltp / op - 1)
-                position = np.clip(
-                    100 * (ltp - lo) / (hi - lo),
-                    0, 100
-                )
-
-                side = "NEUTRAL"
-
-                if (
-                    change > 0.35
-                    and opening > 0
-                    and position >= 60
-                ):
-                    side = "CE"
-
-                elif (
-                    change < -0.35
-                    and opening < 0
-                    and position <= 40
-                ):
-                    side = "PE"
-
-                strength = min(abs(change) / 2.5, 1) * 60
-
-                location = (
-                    position if side == "CE"
-                    else 100 - position
-                )
-
-                score = (
-                    strength + location * 0.4
-                    if side != "NEUTRAL" else 0
-                )
-
-                rows.append({
-                    "Symbol": mapping[key],
-                    "Key": key,
-                    "Side": side,
-                    "LTP": ltp,
-                    "Change %": round(change, 2),
-                    "Open Change %": round(opening, 2),
-                    "Volume": num(q.get("volume"), 0),
-                    "Momentum Score": round(score, 1)
-                })
 
         except Exception as e:
             errors.append(str(e))
+            continue
+
+        for k, q in data.items():
+
+            if k not in m:
+                continue
+
+            p = n(q.get("last_price"))
+            prev = p - n(q.get("net_change"))
+
+            o = q.get("ohlc") or {}
+
+            op, hi, lo = [
+                n(o.get(a))
+                for a in ("open", "high", "low")
+            ]
+
+            if (
+                not all(np.isfinite(
+                    [p, prev, op, hi, lo]
+                ))
+                or min(p, prev, op) <= 0
+                or hi <= lo
+            ):
+                continue
+
+            ch = 100 * (p / prev - 1)
+
+            pos = np.clip(
+                100 * (p - lo) / (hi - lo),
+                0, 100
+            )
+
+            side = "NEUTRAL"
+
+            if ch > .35 and p > op and pos >= 60:
+                side = "CE"
+
+            elif ch < -.35 and p < op and pos <= 40:
+                side = "PE"
+
+            score = 0
+
+            if side != "NEUTRAL":
+                score = (
+                    min(abs(ch) / 2.5, 1) * 60
+                    + (
+                        pos if side == "CE"
+                        else 100 - pos
+                    ) * .4
+                )
+
+            rows.append({
+                "Symbol": m[k],
+                "Key": k,
+                "Side": side,
+                "LTP": p,
+                "Change %": round(ch, 2),
+                "Momentum Score": round(score, 1),
+                "Fresh": fresh(q),
+                "Volume": n(q.get("volume"))
+            })
 
     frame = pd.DataFrame(rows)
 
-    if frame.empty:
-        raise RuntimeError("No usable market quotes")
+    if not frame.empty:
+        frame = frame.sort_values(
+            "Momentum Score",
+            ascending=False
+        )
 
-    return (
-        frame.sort_values(
-            "Momentum Score", ascending=False
-        ),
-        len(stocks),
-        errors
-    )
+    return frame, len(m), errors
 
 
-def parse_candles(data):
+# =====================================
+# HISTORICAL AND LIVE CANDLES
+# =====================================
+
+def parse(d):
     rows = []
 
-    for c in (data or {}).get("candles", []):
+    for c in (d or {}).get("candles", []):
         try:
-            stamp = pd.to_datetime(
-                c[0], utc=True
-            ).tz_convert(IST)
-
             rows.append([
-                stamp,
-                *[float(v) for v in c[1:6]]
+                pd.to_datetime(
+                    c[0], utc=True
+                ).tz_convert(IST),
+                *map(float, c[1:6])
             ])
 
-        except (ValueError, TypeError, IndexError):
+        except Exception:
             continue
 
-    if not rows:
-        return pd.DataFrame()
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "ts", "open", "high",
+            "low", "close", "volume"
+        ]
+    ).set_index("ts").sort_index()
 
-    return (
-        pd.DataFrame(
-            rows,
-            columns=[
-                "timestamp", "open", "high",
-                "low", "close", "volume"
-            ]
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def history(_token, key, day, days=15):
+
+    end = day - timedelta(days=1)
+    start = day - timedelta(days=days)
+
+    return parse(
+        api(
+            f"/v3/historical-candle/"
+            f"{quote(key, safe='')}/"
+            f"minutes/1/{end}/{start}",
+            _token
         )
-        .drop_duplicates("timestamp")
-        .set_index("timestamp")
-        .sort_index()
     )
 
 
-def candles(token, key, now):
-    encoded = quote(key, safe="")
-    end = (now.date() - timedelta(days=1)).isoformat()
-    start = (now.date() - timedelta(days=15)).isoformat()
+def raw(token, key):
 
-    historical = api(
-        f"/v3/historical-candle/{encoded}/"
-        f"minutes/1/{end}/{start}",
-        token
+    h = history(
+        token,
+        key,
+        now().date()
     )
 
-    current = api(
-        f"/v3/historical-candle/intraday/"
-        f"{encoded}/minutes/1",
-        token
+    c = parse(
+        api(
+            f"/v3/historical-candle/intraday/"
+            f"{quote(key, safe='')}/minutes/1",
+            token
+        )
     )
 
-    frames = [
-        parse_candles(historical),
-        parse_candles(current)
+    d = pd.concat([h, c]).sort_index()
+
+    d = d[
+        ~d.index.duplicated(keep="last")
     ]
 
-    frames = [f for f in frames if not f.empty]
+    if d.empty:
+        raise RuntimeError("No candles")
 
-    if not frames:
-        raise RuntimeError("Candle data unavailable")
-
-    df = pd.concat(frames).sort_index()
-    df = df[~df.index.duplicated(keep="last")]
-
-    return df.between_time("09:15", "15:29")
+    return d.between_time("09:15", "15:29")
 
 
-def make_bars(df, minutes, now):
-    rule = f"{minutes}min"
+def bars(d, m, cut):
 
-    counts = df.close.resample(
-        rule, origin="start_day", offset="15min"
-    ).count()
+    r = d.resample(
+        f"{m}min",
+        origin="start_day",
+        offset="15min"
+    )
 
-    bars = df.resample(
-        rule, origin="start_day", offset="15min"
-    ).agg({
+    b = r.agg({
         "open": "first",
         "high": "max",
         "low": "min",
@@ -305,952 +359,1580 @@ def make_bars(df, minutes, now):
         "volume": "sum"
     })
 
-    bars = bars[
-        (counts == minutes)
+    return b[
+        (r.close.count() == m)
         & (
-            bars.index + pd.Timedelta(minutes=minutes)
-            <= pd.Timestamp(now)
+            b.index + pd.Timedelta(minutes=m)
+            <= cut
         )
-    ]
-
-    return bars.dropna(subset=["close"]).copy()
+    ].dropna()
 
 
-def indicators(df):
-    df = df.copy()
+# =====================================
+# STEP 2: AUTOMATED TECHNICAL ANALYST
+# =====================================
 
-    for period in [9, 21, 50]:
-        df[f"ema{period}"] = df.close.ewm(
-            span=period, adjust=False
+def indicators(d):
+
+    d = d.copy()
+
+    for p in (9, 21, 50):
+        d[f"ema{p}"] = d.close.ewm(
+            span=p,
+            adjust=False
         ).mean()
 
-    change = df.close.diff()
+    z = d.close.diff()
 
-    gain = change.clip(lower=0).ewm(
-        alpha=1/9, adjust=False
+    g = z.clip(lower=0).ewm(
+        alpha=1/9,
+        adjust=False
     ).mean()
 
-    loss = (-change.clip(upper=0)).ewm(
-        alpha=1/9, adjust=False
+    l = (-z.clip(upper=0)).ewm(
+        alpha=1/9,
+        adjust=False
     ).mean()
 
-    df["rsi"] = 100 - 100 / (
-        1 + gain / loss.replace(0, np.nan)
+    d["rsi"] = 100 - 100 / (
+        1 + g / l.replace(0, np.nan)
     )
 
-    df.loc[(loss == 0) & (gain > 0), "rsi"] = 100
-    df.loc[(loss == 0) & (gain == 0), "rsi"] = 50
+    d.loc[(l == 0) & (g > 0), "rsi"] = 100
+    d.loc[(l == 0) & (g == 0), "rsi"] = 50
 
     tr = pd.concat([
-        df.high - df.low,
-        (df.high - df.close.shift()).abs(),
-        (df.low - df.close.shift()).abs()
+        d.high - d.low,
+        (d.high - d.close.shift()).abs(),
+        (d.low - d.close.shift()).abs()
     ], axis=1).max(axis=1)
 
-    df["atr"] = tr.ewm(
-        alpha=1/14, adjust=False,
+    d["atr"] = tr.ewm(
+        alpha=1/14,
+        adjust=False,
         min_periods=14
     ).mean()
 
-    up = df.high.diff()
-    down = -df.low.diff()
+    up = d.high.diff()
+    dn = -d.low.diff()
 
-    plus = pd.Series(
-        np.where((up > down) & (up > 0), up, 0),
-        index=df.index
+    plus = np.where(
+        (up > dn) & (up > 0),
+        up, 0
     )
 
-    minus = pd.Series(
-        np.where((down > up) & (down > 0), down, 0),
-        index=df.index
+    minus = np.where(
+        (dn > up) & (dn > 0),
+        dn, 0
     )
 
-    df["plus_di"] = (
-        100 * plus.ewm(
-            alpha=1/14, adjust=False
-        ).mean() / df.atr.replace(0, np.nan)
-    )
+    for name, arr in [
+        ("plus", plus),
+        ("minus", minus)
+    ]:
 
-    df["minus_di"] = (
-        100 * minus.ewm(
-            alpha=1/14, adjust=False
-        ).mean() / df.atr.replace(0, np.nan)
-    )
+        d[name] = (
+            100 * pd.Series(
+                arr,
+                index=d.index
+            ).ewm(
+                alpha=1/14,
+                adjust=False
+            ).mean()
+            / d.atr.replace(0, np.nan)
+        )
 
     dx = (
-        100 * (df.plus_di - df.minus_di).abs()
-        / (df.plus_di + df.minus_di).replace(0, np.nan)
+        100 * (d.plus - d.minus).abs()
+        / (d.plus + d.minus).replace(0, np.nan)
     )
 
-    df["adx"] = dx.ewm(
-        alpha=1/14, adjust=False,
+    d["adx"] = dx.ewm(
+        alpha=1/14,
+        adjust=False,
         min_periods=14
     ).mean()
 
-    df["rvol"] = (
-        df.volume /
-        df.volume.shift(1).rolling(20).mean()
-        .replace(0, np.nan)
+    d["rvol"] = (
+        d.volume
+        / d.volume.shift().rolling(20)
+        .mean().replace(0, np.nan)
     )
 
-    return df
+    return d
 
 
-def technical(token, key, now):
-    raw = candles(token, key, now)
+# =====================================
+# STEP 6: FAKE BREAKOUT PROTECTION
+# =====================================
 
-    b5 = indicators(make_bars(raw, 5, now))
-    b15 = indicators(make_bars(raw, 15, now))
-    b60 = indicators(make_bars(raw, 60, now))
+def technical(token, key):
 
-    if len(b5) < 50 or len(b15) < 25 or len(b60) < 21:
-        raise RuntimeError("Insufficient candle history")
+    cut = now()
+    d = raw(token, key)
 
-    a = b5.iloc[-1]
-    b = b15.iloc[-1]
-    h = b60.iloc[-1]
+    b, b15, b60 = [
+        indicators(bars(d, m, cut))
+        for m in (5, 15, 60)
+    ]
 
-    if now - a.name.to_pydatetime() > timedelta(minutes=10):
-        raise RuntimeError("Stale 5-minute candle")
+    if min(len(b), len(b15), len(b60)) < 21:
+        raise RuntimeError("Insufficient history")
 
-    today = b5[b5.index.date == now.date()]
+    a = b.iloc[-1]
+    h = b15.iloc[-1]
+    j = b60.iloc[-1]
 
-    if len(today) < 3:
-        raise RuntimeError("Opening range incomplete")
+    if (
+        a.name.date() != cut.date()
+        or cut - a.name.to_pydatetime()
+        > timedelta(minutes=10)
+    ):
+        raise RuntimeError("Stale candle")
+
+    today = b[b.index.date == cut.date()]
 
     opening = today.iloc[:3]
 
-    if opening.index[0].time() != time(9, 15):
-        raise RuntimeError("Opening candles missing")
+    if (
+        len(opening) < 3
+        or opening.index[0].time() != time(9, 15)
+    ):
+        raise RuntimeError("Opening range missing")
 
-    or_high = opening.high.max()
-    or_low = opening.low.min()
+    side = "NEUTRAL"
 
-    typical = (today.high + today.low + today.close) / 3
+    if a.close > a.ema9 > a.ema21:
+        side = "CE"
 
-    vwap = (
-        (typical * today.volume).sum() / today.volume.sum()
-        if today.volume.sum() > 0 else np.nan
-    )
+    elif a.close < a.ema9 < a.ema21:
+        side = "PE"
 
-    bullish = a.close > a.ema9 > a.ema21
-    bearish = a.close < a.ema9 < a.ema21
+    s = 1 if side == "CE" else -1
 
-    side = (
-        "CE" if bullish
-        else "PE" if bearish
-        else "NEUTRAL"
-    )
-
-    if side == "CE":
-        higher = b.close > b.ema21 and h.close > h.ema21
-        momentum = a.rsi >= 55 and a.plus_di > a.minus_di
-        breakout = (
-            a.close > or_high
-            and a.close > b5.high.iloc[-6:-1].max()
+    if s == 1:
+        level = max(
+            opening.high.max(),
+            b.high.iloc[-6:-1].max()
         )
-        vwap_ok = np.isfinite(vwap) and a.close > vwap
-
-    elif side == "PE":
-        higher = b.close < b.ema21 and h.close < h.ema21
-        momentum = a.rsi <= 45 and a.minus_di > a.plus_di
-        breakout = (
-            a.close < or_low
-            and a.close < b5.low.iloc[-6:-1].min()
-        )
-        vwap_ok = np.isfinite(vwap) and a.close < vwap
 
     else:
-        higher = momentum = breakout = vwap_ok = False
+        level = min(
+            opening.low.min(),
+            b.low.iloc[-6:-1].min()
+        )
 
-    extension = (
-        abs(a.close - a.ema9) / a.atr
-        if np.isfinite(a.atr) and a.atr > 0
-        else np.inf
+    body = abs(a.close - a.open)
+    rng = a.high - a.low
+
+    closepos = (
+        (a.close - a.low) / rng
+        if rng > 0 else .5
     )
 
-    volume_ok = np.isfinite(a.rvol) and a.rvol >= 1.3
+    vwap = (
+        (
+            today.volume
+            * (today.high + today.low + today.close)
+            / 3
+        ).sum() / today.volume.sum()
+        if today.volume.sum() > 0
+        else np.nan
+    )
+
+    idx = key.startswith("NSE_INDEX|")
+
+    volok = (
+        bool(
+            a.rvol >= 1.3
+            and s * (a.close - vwap) > 0
+        )
+        if not idx else None
+    )
 
     checks = {
         "Trend": side != "NEUTRAL",
-        "Higher TF": higher,
-        "Momentum": momentum,
+
+        "Higher TF": (
+            s * (h.close - h.ema21) > 0
+            and s * (j.close - j.ema21) > 0
+        ),
+
+        "Momentum": (
+            a.rsi >= 55 and a.plus > a.minus
+            if s == 1
+            else a.rsi <= 45 and a.minus > a.plus
+        ),
+
         "ADX": a.adx >= 25,
-        "VWAP": vwap_ok,
-        "Breakout": breakout,
-        "Volume": volume_ok,
-        "Not Extended": extension <= 2
+
+        "Breakout": (
+            s * (a.close - level) > .05 * a.atr
+        ),
+
+        "Candle quality": (
+            body >= .35 * a.atr
+            and (
+                closepos >= .7
+                if s == 1 else closepos <= .3
+            )
+        ),
+
+        "Not extended": (
+            abs(a.close - a.ema9) <= 2 * a.atr
+        ),
+
+        "Spot volume/VWAP": volok
     }
 
-    weights = [10, 15, 10, 10, 10, 15, 5, 5]
-
-    score = sum(
-        w for w, passed in zip(weights, checks.values())
-        if passed
-    )
-
-    return {
-        "Side": side,
-        "Technical Score": score,
-        "RSI": round(a.rsi, 1),
-        "ADX": round(a.adx, 1),
-        "ATR": a.atr,
+    metrics = {
+        "RSI": round(a.rsi, 2),
+        "ADX": round(a.adx, 2),
         "RVOL": round(a.rvol, 2),
         "VWAP": vwap,
-        "Opening High": or_high,
-        "Opening Low": or_low,
-        "Bar": str(a.name),
-        "Checks": checks
+        "Opening High": opening.high.max(),
+        "Opening Low": opening.low.min()
     }
 
+    return side, checks, metrics
 
-def get_expiry(token, key, now):
-    data = api(
+
+# =====================================
+# STEP 4: ADVANCED OPTION CHAIN
+# =====================================
+
+def expiry(token, key):
+
+    d = api(
         "/v2/option/contract",
         token,
         {"instrument_key": key}
-    )
+    ) or []
 
     dates = sorted({
         x["expiry"]
-        for x in (data or [])
-        if x.get("expiry")
-        and x["expiry"] > now.date().isoformat()
+        for x in d
+        if x.get("expiry", "")
+        > now().date().isoformat()
     })
 
     return dates[0] if dates else None
 
 
-def chain_data(token, key, expiry):
-    data = api(
+def chain(token, key, exp):
+
+    d = api(
         "/v2/option/chain",
         token,
         {
             "instrument_key": key,
-            "expiry_date": expiry
+            "expiry_date": exp
         }
-    )
+    ) or []
 
     rows = []
 
-    for item in data or []:
+    for x in d:
+
         for side, field in [
             ("CE", "call_options"),
             ("PE", "put_options")
         ]:
-            option = item.get(field) or {}
-            m = option.get("market_data") or {}
-            g = option.get("option_greeks") or {}
 
-            bid = num(m.get("bid_price"))
-            ask = num(m.get("ask_price"))
+            o = x.get(field) or {}
 
-            spread = (
-                200 * (ask - bid) / (ask + bid)
-                if ask >= bid > 0 else np.nan
-            )
+            m = o.get("market_data") or {}
+            g = o.get("option_greeks") or {}
+
+            bid = n(m.get("bid_price"))
+            ask = n(m.get("ask_price"))
 
             rows.append({
-                "Strike": num(item.get("strike_price")),
-                "Spot": num(item.get("underlying_spot_price")),
+                "Key": o.get("instrument_key"),
                 "Side": side,
-                "LTP": num(m.get("ltp")),
+                "Strike": n(x.get("strike_price")),
+                "Spot": n(x.get("underlying_spot_price")),
+                "LTP": n(m.get("ltp")),
                 "Bid": bid,
                 "Ask": ask,
-                "Spread %": spread,
-                "OI": num(m.get("oi")),
-                "Previous OI": num(m.get("prev_oi")),
-                "Volume": num(m.get("volume")),
-                "Delta": num(g.get("delta")),
-                "Theta": num(g.get("theta")),
-                "Gamma": num(g.get("gamma")),
-                "Vega": num(g.get("vega")),
-                "IV": num(g.get("iv")),
-                "Key": option.get("instrument_key")
+
+                "Spread %": (
+                    200 * (ask - bid) / (ask + bid)
+                    if ask >= bid > 0
+                    else np.nan
+                ),
+
+                "OI": n(m.get("oi")),
+                "Previous OI": n(m.get("prev_oi")),
+                "Volume": n(m.get("volume")),
+
+                **{
+                    k.title(): n(g.get(k))
+                    for k in (
+                        "delta", "theta",
+                        "gamma", "vega", "iv"
+                    )
+                }
             })
 
-    df = pd.DataFrame(rows)
-
-    if not df.empty:
-        df["OI Change"] = df["OI"] - df["Previous OI"]
-
-    return df
+    return (
+        pd.DataFrame(rows).dropna(subset=["Key"])
+        if rows else pd.DataFrame()
+    )
 
 
-def chain_summary(df):
-    ce = df[df.Side == "CE"].dropna(subset=["OI"])
-    pe = df[df.Side == "PE"].dropna(subset=["OI"])
+def summary(c):
 
-    ce_oi = ce.OI.sum()
-    pe_oi = pe.OI.sum()
+    ce = c[c.Side == "CE"]
+    pe = c[c.Side == "PE"]
 
-    pcr = pe_oi / ce_oi if ce_oi > 0 else np.nan
+    co = ce.OI.sum()
+    po = pe.OI.sum()
+
+    pcr = po / co if co > 0 else np.nan
 
     pain = {}
 
-    for strike in df.Strike.dropna().unique():
-        call_loss = (
-            (strike - ce.Strike).clip(lower=0) * ce.OI
-        ).sum()
+    for k in c.Strike.dropna().unique():
 
-        put_loss = (
-            (pe.Strike - strike).clip(lower=0) * pe.OI
-        ).sum()
+        pain[k] = (
+            (
+                (k - ce.Strike).clip(lower=0)
+                * ce.OI
+            ).sum()
 
-        pain[strike] = call_loss + put_loss
+            + (
+                (pe.Strike - k).clip(lower=0)
+                * pe.OI
+            ).sum()
+        )
 
     max_pain = (
         min(pain, key=pain.get)
-        if pain and ce_oi > 0 and pe_oi > 0
+        if pain and co > 0 and po > 0
         else np.nan
     )
 
     return pcr, max_pain
 
 
-@st.cache_data(ttl=86400)
-def lot_sizes():
-    return {
-        x.get("instrument_key"): num(x.get("lot_size"))
-        for x in master()
-        if x.get("segment") == "NSE_FO"
-    }
+# =====================================
+# SESSION STORAGE
+# =====================================
+
+for k, v in {
+    "ranking": pd.DataFrame(),
+    "results": [],
+    "diagnostics": [],
+    "snapshots": {},
+    "chains": {},
+    "signals": {},
+    "journal": [],
+    "last_scan": None,
+    "coverage": "—",
+    "cursor": 0,
+    "news": {},
+    "scan_count": 0
+
+}.items():
+
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+S = st.session_state
 
 
-def select_option(df, side, min_volume, max_spread, max_iv):
-    if df.empty:
-        return pd.DataFrame()
+# =====================================
+# DASHBOARD SETTINGS
+# =====================================
 
-    delta_ok = (
-        df.Delta.between(0.45, 0.70)
-        if side == "CE"
-        else df.Delta.between(-0.70, -0.45)
-    )
-
-    candidates = df[
-        (df.Side == side)
-        & delta_ok
-        & (df.Volume >= min_volume)
-        & (df["Spread %"] <= max_spread)
-        & (df.IV > 0)
-        & (df.IV <= max_iv)
-        & (df.OI > 0)
-        & (df.Ask > 0)
-        & (df.LTP > 0)
-        & df.Key.notna()
-    ].copy()
-
-    if candidates.empty:
-        return candidates
-
-    candidates["Delta Distance"] = (
-        candidates.Delta.abs() - 0.55
-    ).abs()
-
-    return candidates.sort_values(
-        ["Spread %", "Delta Distance", "Volume"],
-        ascending=[True, True, False]
-    ).head(3)
-
-
-def option_setup(
-    token, option, tech, now,
-    capital, risk_budget, rr
-):
-    raw = candles(token, option.Key, now)
-    bars = indicators(make_bars(raw, 5, now))
-
-    if len(bars) < 30:
-        raise RuntimeError("Option history insufficient")
-
-    a = bars.iloc[-1]
-
-    if now - a.name.to_pydatetime() > timedelta(minutes=10):
-        raise RuntimeError("Option candle stale")
-
-    entry = float(option.Ask)
-    atr = num(a.atr)
-
-    if not np.isfinite(atr) or atr <= 0:
-        raise RuntimeError("Option ATR unavailable")
-
-    premium_up = (
-        a.close > a.ema9 > a.ema21
-        and a.rsi >= 52
-        and a.close > bars.close.iloc[-2]
-    )
-
-    not_chasing = (
-        entry <= a.close + 0.5 * atr
-        and entry >= a.close - 0.5 * atr
-    )
-
-    risk = max(
-        1.5 * atr,
-        entry - bars.low.iloc[-3:].min()
-    )
-
-    sl = entry - risk
-
-    if sl <= 0 or risk / entry > 0.25:
-        raise RuntimeError("Option stop risk excessive")
-
-    target = entry + rr * risk
-
-    lot = num(lot_sizes().get(option.Key))
-
-    if not np.isfinite(lot) or lot <= 0:
-        raise RuntimeError("Lot size unavailable")
-
-    lots = max(
-        0,
-        int(min(
-            risk_budget / (risk * lot),
-            capital / (entry * lot)
-        ))
-    )
-
-    score = (
-        tech["Technical Score"]
-        + 10
-        + (10 if premium_up else 0)
-    )
-
-    mandatory = all(tech["Checks"].values())
-
-    qualified = (
-        mandatory
-        and premium_up
-        and not_chasing
-        and lots > 0
-        and entry_window(now)
-        and score >= 90
-    )
-
-    return {
-        "Strike": option.Strike,
-        "Side": option.Side,
-        "Score": score,
-        "Status": "QUALIFIED" if qualified else "WAIT",
-        "Entry": round(entry, 2),
-        "SL": round(sl, 2),
-        "Target": round(target, 2),
-        "R:R": rr,
-        "Lots": lots,
-        "Lot Size": int(lot),
-        "Capital": round(lots * lot * entry, 2),
-        "Planned Risk": round(lots * lot * risk, 2),
-        "Delta": option.Delta,
-        "Theta": option.Theta,
-        "Gamma": option.Gamma,
-        "Vega": option.Vega,
-        "IV": option.IV,
-        "OI Change": option["OI Change"],
-        "Spread %": round(option["Spread %"], 2),
-        "Premium Momentum": premium_up
-    }
-
-
-st.title("NSE F&O PRO V2")
-
-st.caption(
-    "Market Scanner | Technical Engine | "
-    "Option Intelligence | Research Only"
-)
+st.title("NSE F&O PRO — ALL IN ONE")
 
 with st.sidebar:
+
     st.header("Upstox Connection")
 
     token = st.text_input(
-        "Access Token",
-        value=os.getenv("UPSTOX_ACCESS_TOKEN", ""),
+        "Upstox Access Token",
+        value=os.getenv(
+            "UPSTOX_ACCESS_TOKEN", ""
+        ),
         type="password"
     )
 
     st.header("Risk Management")
 
     capital = st.number_input(
-        "Available Capital ₹",
+        "Capital ₹",
         min_value=1000,
         value=100000,
         step=10000
     )
 
-    daily_risk = st.number_input(
-        "Daily Risk Budget ₹",
+    daily = st.number_input(
+        "Daily risk ₹",
         min_value=100,
         value=5000,
         step=500
     )
 
-    used_risk = st.number_input(
-        "Risk Already Used Today ₹",
+    used = st.number_input(
+        "Risk already used ₹",
         min_value=0,
         value=0,
-        step=500
+        step=100
     )
 
-    risk_trade = st.number_input(
-        "Maximum Risk Per Trade ₹",
+    per = st.number_input(
+        "Risk per trade ₹",
         min_value=100,
         value=1500,
         step=100
     )
 
     rr = st.slider(
-        "Reward / Risk",
-        2.0, 4.0, 2.0, 0.25
+        "Reward / risk",
+        2.0, 4.0, 2.0, .25
     )
 
-    min_volume = st.number_input(
-        "Minimum Option Volume",
+    minvol = st.number_input(
+        "Minimum option volume",
         min_value=100,
         value=10000,
         step=1000
     )
 
-    max_spread = st.slider(
-        "Maximum Spread %",
-        0.5, 5.0, 2.0, 0.5
+    spread = st.slider(
+        "Maximum spread %",
+        .5, 5.0, 2.0, .5
     )
 
-    max_iv = st.slider(
+    iv = st.slider(
         "Maximum IV %",
         10, 100, 45
     )
 
-    deep_count = st.slider(
-        "Deep Scan Per Side",
-        1, 10, 3
+    count = st.slider(
+        "Deep scan per side per cycle",
+        1, 20, 5
     )
 
     auto = st.toggle(
-        "Auto Scan Every 120 Seconds",
+        "Auto scan (120 seconds)",
         value=False
     )
 
-    st.caption(
-        "Expiry-day contracts excluded. "
-        "No automatic orders."
+    st.header("Navigation")
+
+    page = st.radio(
+        "Select Section",
+        [
+            "Home",
+            "Market Scanner",
+            "Option Chain & Greeks",
+            "Deep Analysis",
+            "News & Events",
+            "Signal History",
+            "Backtesting",
+            "Trading Journal"
+        ]
     )
 
-if "journal" not in st.session_state:
-    st.session_state.journal = []
-
-if "results" not in st.session_state:
-    st.session_state.results = pd.DataFrame()
-
-if "ranking" not in st.session_state:
-    st.session_state.ranking = pd.DataFrame()
-
-if "diagnostics" not in st.session_state:
-    st.session_state.diagnostics = []
-
-if "last_scan" not in st.session_state:
-    st.session_state.last_scan = None
+    st.caption(
+        "Research only • No orders • "
+        "Expiry day excluded"
+    )
 
 
-@st.fragment(run_every="120s" if auto else None)
+def budget():
+    return min(
+        per,
+        max(0, daily - used)
+    )
+
+
+# =====================================
+# STEP 5: MASTER SCORING SYSTEM
+# =====================================
+
+def option_setup(
+    o, t, checks, metrics,
+    c, exp, symbol, old
+):
+
+    q = quotes(
+        token, [o.Key]
+    ).get(o.Key, {})
+
+    if not fresh(q):
+        raise RuntimeError(
+            "Option quote stale or timestamp missing"
+        )
+
+    b = indicators(
+        bars(
+            raw(token, o.Key),
+            5,
+            now()
+        )
+    )
+
+    if len(b) < 30:
+        raise RuntimeError(
+            "Insufficient option history"
+        )
+
+    a = b.iloc[-1]
+
+    if (
+        a.name.date() != now().date()
+        or now() - a.name.to_pydatetime()
+        > timedelta(minutes=10)
+    ):
+        raise RuntimeError("Option candles stale")
+
+    entry = float(o.Ask)
+    atr = n(a.atr)
+
+    if not np.isfinite(atr) or atr <= 0:
+        raise RuntimeError("ATR missing")
+
+    prev = old.get(o.Key)
+
+    elapsed = (
+        (now() - prev["time"]).total_seconds()
+        if prev else 0
+    )
+
+    comparable = (
+        prev is not None
+        and 20 <= elapsed <= 600
+        and prev["time"].date() == now().date()
+    )
+
+    oi = (
+        o.OI - prev["OI"]
+        if comparable else np.nan
+    )
+
+    vol = (
+        o.Volume - prev["Volume"]
+        if comparable else np.nan
+    )
+
+    prem = (
+        o.LTP - prev["LTP"]
+        if comparable else np.nan
+    )
+
+    opposite = c[
+        (c.Side != o.Side)
+        & (c.Strike == o.Strike)
+    ]
+
+    opp = (
+        opposite.iloc[0]
+        if len(opposite) else None
+    )
+
+    oprev = (
+        old.get(opp.Key)
+        if opp is not None else None
+    )
+
+    oppchange = (
+        opp.OI - oprev["OI"]
+        if oprev
+        and 20 <= (
+            now() - oprev["time"]
+        ).total_seconds() <= 600
+        and oprev["time"].date() == now().date()
+        else np.nan
+    )
+
+    pcr, pain = summary(c)
+
+    risk = max(
+        1.5 * atr,
+        entry - b.low.iloc[-3:].min()
+    )
+
+    sl = entry - risk
+
+    lot = next(
+        (
+            n(x.get("lot_size"))
+            for x in master()
+            if x.get("instrument_key") == o.Key
+        ),
+        np.nan
+    )
+
+    if (
+        not np.isfinite(lot)
+        or lot <= 0
+        or sl <= 0
+        or risk / entry > .25
+    ):
+        raise RuntimeError("Risk or lot invalid")
+
+    lots = int(
+        min(
+            budget() / (risk * lot),
+            capital / (entry * lot)
+        )
+    )
+
+    premium = bool(
+        a.close > a.ema9 > a.ema21
+        and a.rsi >= 52
+        and a.close > b.close.iloc[-2]
+        and prem > 0
+    )
+
+    greek = bool(
+        np.isfinite([
+            o.Delta,
+            o.Theta,
+            o.Gamma,
+            o.Vega,
+            o.IV
+        ]).all()
+
+        and abs(o.Theta) / entry <= .15
+        and o.Gamma >= 0
+        and o.Vega >= 0
+    )
+
+    oiok = bool(oi > 0)
+
+    volok = bool(
+        vol > 0
+        and a.rvol >= 1.1
+    )
+
+    # OI alone cannot identify option buyers
+    # or writers. Opposite OI is context.
+
+    groups = {
+        "Spot direction": all(
+            bool(v)
+            for v in checks.values()
+            if v is not None
+        ),
+
+        "Premium momentum": premium,
+
+        "Live OI": oiok,
+
+        "Fresh volume": volok,
+
+        "Opposite OI observed": bool(
+            np.isfinite(oppchange)
+        ),
+
+        "Delta": (
+            .45 <= abs(o.Delta) <= .70
+        ),
+
+        "IV / Greeks": (
+            greek and 0 < o.IV <= iv
+        )
+    }
+
+    weights = [
+        25, 15, 15, 15, 5, 10, 15
+    ]
+
+    score = sum(
+        w
+        for w, v in zip(
+            weights, groups.values()
+        )
+        if v
+    )
+
+    safe = (
+        abs(entry - a.close) <= .5 * atr
+        and lots > 0
+        and entry_window(token)
+        and all(groups.values())
+    )
+
+    event = S.news.get(
+        symbol,
+        "UNREVIEWED"
+    )
+
+    safe = safe and event == "CLEAR"
+
+    return {
+        "Symbol": symbol,
+        "Key": o.Key,
+        "Side": o.Side,
+        "Strike": o.Strike,
+        "Expiry": exp,
+        "Score": score,
+
+        "Status": (
+            "QUALIFIED" if safe else "WAIT"
+        ),
+
+        "Entry": round(entry, 2),
+        "SL": round(sl, 2),
+
+        "Target": round(
+            entry + rr * risk, 2
+        ),
+
+        "Target 2": round(
+            entry + (rr + 1) * risk, 2
+        ),
+
+        "Lots": lots,
+        "Lot Size": int(lot),
+
+        "Planned Risk": round(
+            lots * lot * risk, 2
+        ),
+
+        "Capital": round(
+            lots * lot * entry, 2
+        ),
+
+        "Current Premium": o.LTP,
+        "Delta": o.Delta,
+        "Theta": o.Theta,
+        "Gamma": o.Gamma,
+        "Vega": o.Vega,
+        "IV": o.IV,
+        "OI Change": oi,
+        "Fresh Volume": vol,
+        "Premium Change": prem,
+        "Opposite OI Change": oppchange,
+        "PCR": pcr,
+        "Max Pain": pain,
+        "Spread %": o["Spread %"],
+        "News Review": event,
+        "Time": now().isoformat(),
+
+        "Checks": {
+            **checks,
+            **groups
+        },
+
+        **metrics
+    }
+
+
+# =====================================
+# LIVE SIGNAL TRACKING
+# =====================================
+
+def track():
+
+    active = [
+        v for v in S.signals.values()
+        if v["Status"] == "ACTIVE"
+        and v["Time"][:10] == now().date().isoformat()
+    ]
+
+    if not active or not open_market(token):
+        return
+
+    data = quotes(
+        token,
+        [v["Key"] for v in active]
+    )
+
+    for v in active:
+
+        q = data.get(v["Key"], {})
+
+        p = n(q.get("last_price"))
+
+        if not fresh(q) or not np.isfinite(p):
+            continue
+
+        v["Current Premium"] = p
+
+        v["Observed P&L"] = round(
+            (p - v["Entry"])
+            * v["Lots"]
+            * v["Lot Size"],
+            2
+        )
+
+        if p <= v["SL"]:
+            v["Status"] = "SL OBSERVED"
+
+        elif p >= v["Target"]:
+            v["Status"] = "TARGET OBSERVED"
+
+        elif now().time() >= time(15, 20):
+            v["Status"] = "EOD OBSERVED"
+
+
+# =====================================
+# COMPLETE MARKET SCANNER
+# =====================================
+
+def scan():
+
+    S.results = []
+    S.diagnostics = []
+    S.last_scan = None
+
+    r, total, errors = ranking(token)
+
+    S.ranking = r
+    S.coverage = f"{len(r)}/{total}"
+    S.diagnostics = errors
+
+    if (
+        r.empty
+        or not entry_window(token)
+        or budget() <= 0
+    ):
+        S.last_scan = now()
+        return
+
+    selected = []
+
+    for side in ("CE", "PE"):
+
+        z = r[
+            (r.Side == side)
+            & r.Fresh
+        ]
+
+        start = (
+            S.cursor * count
+        ) % max(1, len(z))
+
+        selected.extend(
+            pd.concat([
+                z.iloc[start:],
+                z.iloc[:start]
+            ]).head(count).to_dict("records")
+        )
+
+    S.cursor += 1
+
+    selected.extend({
+        "Symbol": k,
+        "Key": v,
+        "Side": "AUTO"
+    } for k, v in INDEXES.items())
+
+    progress = st.progress(0)
+
+    for i, row in enumerate(selected):
+
+        sym = row["Symbol"]
+        key = row["Key"]
+
+        try:
+
+            side, checks, metrics = technical(
+                token, key
+            )
+
+            if (
+                side == "NEUTRAL"
+                or row["Side"] not in ("AUTO", side)
+            ):
+                raise RuntimeError("Trend conflict")
+
+            exp = expiry(token, key)
+
+            if not exp:
+                raise RuntimeError(
+                    "No eligible expiry"
+                )
+
+            c = chain(token, key, exp)
+
+            if c.empty:
+                raise RuntimeError(
+                    "Empty option chain"
+                )
+
+            old = S.snapshots.get(key, {})
+
+            S.chains[sym] = c
+
+            S.snapshots[key] = {
+                x.Key: {
+                    "time": now(),
+                    "OI": x.OI,
+                    "Volume": x.Volume,
+                    "LTP": x.LTP
+                }
+
+                for _, x in c.iterrows()
+            }
+
+            if not all(
+                bool(v)
+                for v in checks.values()
+                if v is not None
+            ):
+
+                failed = [
+                    k for k, v in checks.items()
+                    if v is not None and not v
+                ]
+
+                raise RuntimeError(
+                    "Failed: " + ", ".join(failed)
+                )
+
+            z = c[
+                (c.Side == side)
+                & c.Delta.abs().between(.45, .70)
+                & (c.Volume >= minvol)
+                & (c["Spread %"] <= spread)
+                & (c.IV > 0)
+                & (c.IV <= iv)
+                & (c.OI > 0)
+                & (c.Ask > 0)
+                & (c.LTP > 0)
+            ].copy()
+
+            z = z[
+                (z.Delta > 0)
+                if side == "CE"
+                else (z.Delta < 0)
+            ]
+
+            z["Distance"] = (
+                z.Delta.abs() - .55
+            ).abs()
+
+            if z.empty:
+                raise RuntimeError(
+                    "No eligible option"
+                )
+
+            options = z.sort_values(
+                [
+                    "Spread %",
+                    "Distance",
+                    "Volume"
+                ],
+                ascending=[
+                    True, True, False
+                ]
+            ).head(3)
+
+            for _, o in options.iterrows():
+
+                try:
+
+                    v = option_setup(
+                        o,
+                        side,
+                        checks,
+                        metrics,
+                        c,
+                        exp,
+                        sym,
+                        old
+                    )
+
+                    S.results.append(v)
+
+                    if v["Status"] == "QUALIFIED":
+
+                        ident = (
+                            now().date().isoformat()
+                            + "|" + sym
+                        )
+
+                        if ident not in S.signals:
+
+                            S.signals[ident] = {
+                                **v,
+                                "Status": "ACTIVE",
+                                "Observed P&L": 0
+                            }
+
+                        break
+
+                except Exception as e:
+
+                    S.diagnostics.append(
+                        f"{sym} option: {e}"
+                    )
+
+        except Exception as e:
+
+            S.diagnostics.append(
+                f"{sym}: {e}"
+            )
+
+        progress.progress(
+            (i + 1) / len(selected)
+        )
+
+    progress.empty()
+
+    S.last_scan = now()
+    S.scan_count += 1
+
+
+# =====================================
+# MAIN DASHBOARD
+# QUALIFIED CALLS ALWAYS VISIBLE
+# =====================================
+
+@st.fragment(
+    run_every="120s" if auto else None
+)
 def dashboard():
-    now = datetime.now(IST)
 
-    remaining = max(0, daily_risk - used_risk)
+    status = (
+        exchange(token)
+        if token else "UNKNOWN"
+    )
 
-    budget = min(risk_trade, remaining)
+    opened = bool(
+        token and open_market(token)
+    )
 
     a, b, c = st.columns(3)
 
-    a.metric("Market Window", (
-        "OPEN" if market_open(now) else "CLOSED"
-    ))
-
-    b.metric("Remaining Risk ₹", remaining)
-
-    c.metric("Entry Window", (
-        "ACTIVE" if entry_window(now) else "WAIT"
-    ))
-
-    st.caption(
-        f"IST: {now:%d-%m-%Y %H:%M:%S}"
+    a.metric(
+        "Market",
+        "OPEN" if opened
+        else "CLOSED / UNVERIFIED"
     )
 
-    if not token:
-        st.info("Enter Upstox Access Token")
-        return
+    b.metric(
+        "Coverage",
+        S.coverage
+    )
+
+    c.metric(
+        "Remaining risk ₹",
+        max(0, daily - used)
+    )
+
+    st.caption(
+        f"{now():%d-%m-%Y %H:%M:%S} IST"
+        f" | Exchange: {status}"
+    )
 
     clicked = st.button(
         "SCAN COMPLETE F&O MARKET",
         type="primary"
     )
 
-    if clicked or (auto and market_open(now)):
-        st.session_state.results = pd.DataFrame()
-        st.session_state.ranking = pd.DataFrame()
-        st.session_state.diagnostics = []
-        st.session_state.last_scan = None
+    if token and (
+        clicked or (auto and opened)
+    ):
 
         try:
-            with st.spinner("Scanning F&O market..."):
-                ranking, total, errors = scan_market(token)
 
-            st.session_state.ranking = ranking
-            st.session_state.last_scan = now
+            track()
 
-            st.session_state.coverage = (
-                f"{len(ranking)} / {total} stocks"
-            )
-
-            diagnostics = [
-                f"Quote batch error: {e}"
-                for e in errors
-            ]
-
-            results = []
-
-            if entry_window(now) and budget > 0:
-                selected = pd.concat([
-                    ranking[ranking.Side == "CE"]
-                    .head(deep_count),
-                    ranking[ranking.Side == "PE"]
-                    .head(deep_count)
-                ])
-
-                index_rows = pd.DataFrame([
-                    {
-                        "Symbol": name,
-                        "Key": key,
-                        "Side": "AUTO"
-                    }
-                    for name, key in INDEXES.items()
-                ])
-
-                selected = pd.concat([
-                    selected, index_rows
-                ], ignore_index=True)
-
-                progress = st.progress(0)
-
-                for i, row in selected.iterrows():
-                    symbol = row.Symbol
-
-                    try:
-                        current_time = datetime.now(IST)
-
-                        tech = technical(
-                            token, row.Key, current_time
-                        )
-
-                        side = tech["Side"]
-
-                        if side == "NEUTRAL":
-                            raise RuntimeError("Neutral trend")
-
-                        if row.Side not in ("AUTO", side):
-                            raise RuntimeError("Trend conflict")
-
-                        if not all(tech["Checks"].values()):
-                            failed = [
-                                k for k, v
-                                in tech["Checks"].items()
-                                if not v
-                            ]
-
-                            raise RuntimeError(
-                                "Failed: " + ", ".join(failed)
-                            )
-
-                        expiry = get_expiry(
-                            token, row.Key, current_time
-                        )
-
-                        if not expiry:
-                            raise RuntimeError("No eligible expiry")
-
-                        chain = chain_data(
-                            token, row.Key, expiry
-                        )
-
-                        if chain.empty:
-                            raise RuntimeError("Empty option chain")
-
-                        pcr, pain = chain_summary(chain)
-
-                        options = select_option(
-                            chain, side, min_volume,
-                            max_spread, max_iv
-                        )
-
-                        if options.empty:
-                            raise RuntimeError(
-                                "No liquid eligible option"
-                            )
-
-                        for _, option in options.iterrows():
-                            try:
-                                setup = option_setup(
-                                    token,
-                                    option,
-                                    tech,
-                                    datetime.now(IST),
-                                    capital,
-                                    budget,
-                                    rr
-                                )
-
-                                setup.update({
-                                    "Symbol": symbol,
-                                    "Expiry": expiry,
-                                    "RSI": tech["RSI"],
-                                    "ADX": tech["ADX"],
-                                    "RVOL": tech["RVOL"],
-                                    "PCR": pcr,
-                                    "Max Pain": pain,
-                                    "Time": datetime.now(IST)
-                                    .isoformat()
-                                })
-
-                                results.append(setup)
-
-                                if setup["Status"] == "QUALIFIED":
-                                    break
-
-                            except Exception as e:
-                                diagnostics.append(
-                                    f"{symbol} option: {e}"
-                                )
-
-                    except Exception as e:
-                        diagnostics.append(
-                            f"{symbol}: {e}"
-                        )
-
-                    progress.progress(
-                        min((i + 1) / len(selected), 1.0)
-                    )
-
-                progress.empty()
-
-            st.session_state.results = pd.DataFrame(results)
-            st.session_state.diagnostics = diagnostics
+            with st.spinner(
+                "Scanning F&O market..."
+            ):
+                scan()
 
         except Exception as e:
-            st.error(f"Scanner error: {e}")
+            st.error(str(e))
 
-    ranking = st.session_state.ranking
-    results = st.session_state.results
+    if not token:
+        st.info("Enter Upstox Access Token")
 
-    if st.session_state.last_scan:
-        age = (
-            datetime.now(IST)
-            - st.session_state.last_scan
-        ).total_seconds()
+    st.header(
+        "🎯 Final Qualified Calls"
+    )
 
-        st.caption(
-            f"Last scan: "
-            f"{st.session_state.last_scan:%H:%M:%S} IST"
-            f" | Coverage: "
-            f"{st.session_state.get('coverage', 'N/A')}"
+    active = [
+        v for v in S.signals.values()
+        if v["Status"] == "ACTIVE"
+        and v["Time"][:10] == now().date().isoformat()
+    ]
+
+    if not active:
+
+        st.info(
+            "NO TRADE / WAIT — "
+            "No fully confirmed setup"
         )
 
-        if age > 180:
-            st.warning("Snapshot stale. Refresh before use.")
+    if active and not opened:
+        st.warning(
+            "Market closed or unverified. "
+            "Displayed signals are historical observations, "
+            "not fresh entries."
+        )
 
-    else:
-        age = np.inf
+    for v in active:
 
-    st.header("1. Final Qualified Opportunities")
+        with st.container(border=True):
 
-    if (
-        results.empty
-        or age > 180
-        or not entry_window(datetime.now(IST))
-        or budget <= 0
-    ):
-        st.info("NO TRADE / WAIT")
+            st.subheader(
+                f"{v['Symbol']} "
+                f"{v['Strike']:g} "
+                f"{v['Side']} | {v['Expiry']}"
+            )
 
-    else:
-        qualified = results[
-            (results.Status == "QUALIFIED")
-            & (results["Planned Risk"] <= budget)
-            & (results.Capital <= capital)
-        ].sort_values(
-            ["Score", "Spread %"],
-            ascending=[False, True]
-        ).drop_duplicates("Symbol").head(5)
+            st.caption(
+                f"Research signal | {v['Time']}"
+                f" | Score {v['Score']}/100"
+            )
 
-        if qualified.empty:
-            st.info("NO TRADE — filters not satisfied")
+            cols = st.columns(3)
 
-        else:
+            for i, k in enumerate([
+                "Entry",
+                "Current Premium",
+                "SL",
+                "Target",
+                "Target 2",
+                "Lots"
+            ]):
+
+                cols[i % 3].metric(
+                    k, v[k]
+                )
+
+            st.progress(
+                min(v["Score"] / 100, 1.0)
+            )
+
+            st.subheader("Complete Trade Details")
+
+            details = {
+                k: val
+                for k, val in v.items()
+                if k not in (
+                    "Checks", "Key"
+                )
+            }
+
             st.dataframe(
-                qualified[[
-                    "Symbol", "Expiry", "Strike", "Side",
-                    "Score", "Entry", "SL", "Target",
-                    "Lots", "Planned Risk"
-                ]],
+                pd.DataFrame(
+                    list(details.items()),
+                    columns=[
+                        "Parameter",
+                        "Value"
+                    ]
+                ).astype(str),
                 hide_index=True,
                 use_container_width=True
             )
+
+            st.subheader(
+                "Signal Confirmation"
+            )
+
+            for name, passed in v["Checks"].items():
+
+                if passed is None:
+                    st.write(
+                        f"➖ {name}: Not applicable"
+                    )
+
+                elif bool(passed):
+                    st.write(
+                        f"✅ {name}"
+                    )
+
+                else:
+                    st.write(
+                        f"❌ {name}"
+                    )
 
             st.warning(
-                "Alternative research setups, not simultaneous "
-                "positions. Combined risk must stay within "
-                "the daily budget."
+                "Research signal, not an executed trade. "
+                "Recheck live bid/ask before entry. "
+                "Calls are alternatives, not simultaneous "
+                "positions."
             )
 
-    st.header("2. Top CE / PE Watchlist")
+    if S.last_scan:
 
-    left, right = st.columns(2)
+        st.caption(
+            f"Last completed scan: "
+            f"{S.last_scan:%H:%M:%S} IST"
+        )
 
-    if not ranking.empty:
-        columns = [
-            "Symbol", "LTP", "Change %",
-            "Momentum Score"
-        ]
+        if (
+            now() - S.last_scan
+        ).total_seconds() > 180:
 
-        with left:
-            st.subheader("TOP 10 CE")
-            st.dataframe(
-                ranking[ranking.Side == "CE"]
-                .head(10)[columns],
-                hide_index=True,
-                use_container_width=True
+            st.warning(
+                "Scan snapshot is stale. Refresh before use."
             )
 
-        with right:
-            st.subheader("TOP 10 PE")
-            st.dataframe(
-                ranking[ranking.Side == "PE"]
-                .head(10)[columns],
-                hide_index=True,
-                use_container_width=True
-            )
+    if not opened:
 
-    st.header("3. Deep Analysis Results")
+        st.warning(
+            "No new calls while exchange is closed "
+            "or market status cannot be verified."
+        )
 
-    if not results.empty:
+    st.divider()
+
+    # =================================
+    # MARKET WATCHLIST
+    # =================================
+
+    if page in (
+        "Home",
+        "Market Scanner"
+    ):
+
+        r = S.ranking
+
+        if not r.empty:
+
+            a, b = st.columns(2)
+
+            for col, side in [
+                (a, "CE"),
+                (b, "PE")
+            ]:
+
+                col.subheader(
+                    "TOP 10 " + side
+                )
+
+                col.dataframe(
+                    r[r.Side == side]
+                    .head(10)
+                    .drop(columns="Key"),
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+            if page == "Market Scanner":
+
+                st.header(
+                    "Full F&O Market Ranking"
+                )
+
+                st.dataframe(
+                    r,
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+    # =================================
+    # DEEP TECHNICAL ANALYSIS
+    # =================================
+
+    if page == "Deep Analysis":
+
+        st.header(
+            "Deep Technical Analysis"
+        )
+
         st.dataframe(
-            results,
-            hide_index=True,
+            pd.DataFrame([
+                {
+                    k: x
+                    for k, x in v.items()
+                    if k != "Checks"
+                }
+                for v in S.results
+            ]),
+            use_container_width=True
+        )
+
+        st.write(S.diagnostics)
+
+    # =================================
+    # OPTION CHAIN AND GREEKS
+    # =================================
+
+    if page == "Option Chain & Greeks":
+
+        st.header(
+            "Advanced Option Chain"
+        )
+
+        for sym, c in S.chains.items():
+
+            with st.expander(sym):
+
+                pcr, pain = summary(c)
+
+                a, b = st.columns(2)
+
+                a.metric(
+                    "PCR",
+                    round(pcr, 2)
+                )
+
+                b.metric(
+                    "Max Pain",
+                    pain
+                )
+
+                st.dataframe(
+                    c,
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+    # =================================
+    # SIGNAL HISTORY
+    # =================================
+
+    if page == "Signal History":
+
+        st.header(
+            "Signal History & Tracking"
+        )
+
+        d = pd.DataFrame([
+            {
+                k: x
+                for k, x in v.items()
+                if k != "Checks"
+            }
+            for v in S.signals.values()
+        ])
+
+        st.dataframe(
+            d,
             use_container_width=True
         )
 
         st.download_button(
-            "Download Analysis CSV",
-            results.to_csv(index=False),
-            file_name="fo_pro_analysis.csv",
-            mime="text/csv"
+            "Download Signals CSV",
+            d.to_csv(index=False),
+            "signals.csv"
         )
 
-    with st.expander("Rejected Setups / Diagnostics"):
-        for message in st.session_state.diagnostics:
-            st.write(message)
+    with st.expander(
+        "Rejected Setups / Diagnostics"
+    ):
 
-    with st.expander("Full Market Ranking"):
-        st.dataframe(
-            ranking,
-            hide_index=True,
-            use_container_width=True
+        st.write(
+            S.diagnostics
         )
 
-    st.warning(
-        "Research only. Scores are rule-based, "
-        "not validated win probabilities. "
-        "Exchange holidays are not verified. "
-        "Brokerage, taxes and slippage excluded."
+    st.caption(
+        "Scores are rule-based, not win probabilities. "
+        "Deep scan rotates candidates. "
+        "Full quote coverage is not full technical coverage."
     )
 
 
 dashboard()
 
+
+# =====================================
+# STEP 3: NEWS AND EVENTS
+# MANUAL REVIEW
+# =====================================
+
+if page == "News & Events":
+
+    st.header(
+        "News & Event Analysis"
+    )
+
+    st.markdown(
+        "[NSE Corporate Announcements]"
+        "(https://www.nseindia.com/"
+        "companies-listing/"
+        "corporate-filings-announcements)"
+    )
+
+    st.warning(
+        "Automatic verified news feed is not configured. "
+        "Unreviewed symbols cannot qualify. "
+        "CLEAR means relevant current news was reviewed, "
+        "not that the news predicts a trade."
+    )
+
+    if token:
+
+        syms = sorted(
+            set(instruments().values())
+            | set(INDEXES)
+        )
+
+        sym = st.selectbox(
+            "Select Stock",
+            syms
+        )
+
+        verdict = st.selectbox(
+            "News Review",
+            [
+                "UNREVIEWED",
+                "CLEAR",
+                "BLOCK"
+            ]
+        )
+
+        if st.button(
+            "Save News Review"
+        ):
+
+            S.news[sym] = verdict
+
+            st.success(
+                f"{sym}: {verdict}"
+            )
+
+        st.write(
+            S.news
+        )
+
+
+# =====================================
+# STEP 7: BACKTESTING
+# HISTORICAL DATA REQUIRED
+# =====================================
+
+if page == "Backtesting":
+
+    st.header(
+        "Strategy Backtesting"
+    )
+
+    st.info(
+        "Full options backtesting requires timestamped "
+        "historical option chain, OI, Greeks, bid/ask "
+        "and news data."
+    )
+
+    st.warning(
+        "Current snapshots cannot reconstruct "
+        "historical option-chain conditions. "
+        "No simulated accuracy is reported."
+    )
+
+    st.write(
+        "Download signal history and collect "
+        "forward observations before evaluating "
+        "the complete strategy."
+    )
+
+
+# =====================================
+# TRADING JOURNAL
+# =====================================
+
+if page == "Trading Journal":
+
+    st.header(
+        "Trading Journal"
+    )
+
+    with st.form("journal"):
+
+        sym = st.text_input(
+            "Stock / Option Contract"
+        )
+
+        side = st.selectbox(
+            "Side",
+            ["CE", "PE"]
+        )
+
+        en = st.number_input(
+            "Entry",
+            min_value=0.0
+        )
+
+        ex = st.number_input(
+            "Exit",
+            min_value=0.0
+        )
+
+        qty = st.number_input(
+            "Quantity",
+            min_value=1
+        )
+
+        charges = st.number_input(
+            "Charges",
+            min_value=0.0
+        )
+
+        notes = st.text_area(
+            "Trade Notes"
+        )
+
+        submitted = st.form_submit_button(
+            "Save Trade"
+        )
+
+        if submitted and sym and en > 0:
+
+            S.journal.append({
+                "Time": now().isoformat(),
+                "Symbol": sym,
+                "Side": side,
+                "Entry": en,
+                "Exit": ex,
+                "Quantity": qty,
+                "Net P&L": (
+                    (ex - en) * qty - charges
+                ),
+                "Notes": notes
+            })
+
+    if S.journal:
+
+        d = pd.DataFrame(
+            S.journal
+        )
+
+        p = d["Net P&L"]
+
+        a, b, c = st.columns(3)
+
+        a.metric(
+            "Net P&L",
+            round(p.sum(), 2)
+        )
+
+        b.metric(
+            "Win Rate",
+            f"{100 * (p > 0).mean():.1f}%"
+        )
+
+        loss = -p[p < 0].sum()
+
+        c.metric(
+            "Profit Factor",
+            round(
+                p[p > 0].sum() / loss, 2
+            )
+            if loss > 0 else "N/A"
+        )
+
+        st.dataframe(
+            d,
+            use_container_width=True
+        )
+
+        st.download_button(
+            "Download Trading Journal",
+            d.to_csv(index=False),
+            "journal.csv"
+        )
+
+
 st.divider()
 
-st.header("4. Trading Journal")
-
-with st.form("trade_journal"):
-    symbol = st.text_input("Stock / Option Contract")
-
-    side = st.selectbox("Trade Side", ["CE", "PE"])
-
-    entry = st.number_input(
-        "Actual Entry",
-        min_value=0.0,
-        step=0.05
-    )
-
-    exit_price = st.number_input(
-        "Actual Exit",
-        min_value=0.0,
-        step=0.05
-    )
-
-    quantity = st.number_input(
-        "Actual Quantity",
-        min_value=1,
-        value=1
-    )
-
-    charges = st.number_input(
-        "Total Charges ₹",
-        min_value=0.0
-    )
-
-    notes = st.text_area("Trade Notes")
-
-    submitted = st.form_submit_button("Save Trade")
-
-    if submitted and symbol and entry > 0:
-        pnl = (exit_price - entry) * quantity - charges
-
-        st.session_state.journal.append({
-            "Time": datetime.now(IST).isoformat(),
-            "Symbol": symbol,
-            "Side": side,
-            "Entry": entry,
-            "Exit": exit_price,
-            "Quantity": quantity,
-            "Charges": charges,
-            "Net P&L": round(pnl, 2),
-            "Notes": notes
-        })
-
-if st.session_state.journal:
-    journal = pd.DataFrame(st.session_state.journal)
-
-    pnl = journal["Net P&L"]
-
-    wins = pnl[pnl > 0].sum()
-    losses = abs(pnl[pnl < 0].sum())
-
-    a, b, c = st.columns(3)
-
-    a.metric("Net P&L ₹", round(pnl.sum(), 2))
-
-    b.metric(
-        "Win Rate",
-        f"{100 * (pnl > 0).mean():.1f}%"
-    )
-
-    c.metric(
-        "Profit Factor",
-        round(wins / losses, 2)
-        if losses > 0 else "N/A"
-    )
-
-    st.dataframe(
-        journal,
-        hide_index=True,
-        use_container_width=True
-    )
-
-    st.download_button(
-        "Download Trading Journal",
-        journal.to_csv(index=False),
-        file_name="trading_journal.csv",
-        mime="text/csv"
-    )
-
 st.caption(
-    "Journal is session-based. Download CSV before closing. "
-    "Historical options backtesting is not implemented."
+    "NSE F&O PRO — ALL IN ONE | "
+    "Session-only storage | "
+    "Auto scan requires an active Streamlit session | "
+    "No automatic real orders | "
+    "Export records before closing."
 )
