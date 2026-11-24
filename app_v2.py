@@ -14,7 +14,7 @@ import streamlit as st
 from news_engine import assess_news, scan_news_market
 
 st.set_page_config(
-    page_title="NSE F&O PRO — ALL IN ONE V3",
+    page_title="NSE F&O PRO — ALL IN ONE V4",
     page_icon="📊",
     layout="wide"
 )
@@ -32,6 +32,14 @@ MASTER = (
     "https://assets.upstox.com/"
     "market-quote/instruments/exchange/NSE.json.gz"
 )
+
+NEWS_SOURCES = [
+    "Google News",
+    "NSE Announcements",
+    "BSE Announcements",
+    "NSE Bulk Deals",
+    "NSE Block Deals"
+]
 
 
 def now():
@@ -71,7 +79,7 @@ def api(path, token, params=None):
     return p.get("data")
 
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def master():
 
     r = requests.get(MASTER, timeout=30)
@@ -82,12 +90,12 @@ def master():
     )
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def instruments():
 
     m = master()
 
-    u = {
+    underlying = {
         x.get("underlying_key")
         for x in m
         if x.get("segment") == "NSE_FO"
@@ -98,11 +106,11 @@ def instruments():
         x["instrument_key"]: x["trading_symbol"]
         for x in m
         if x.get("segment") == "NSE_EQ"
-        and x.get("instrument_key") in u
+        and x.get("instrument_key") in underlying
     }
 
 
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=86400, show_spinner=False)
 def lot_sizes():
 
     return {
@@ -113,7 +121,7 @@ def lot_sizes():
 
 
 # =====================================
-# MARKET STATUS AND FRESHNESS
+# MARKET STATUS
 # =====================================
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -138,8 +146,9 @@ def open_market(token):
 
     t = now()
 
-    return (
-        t.weekday() < 5
+    return bool(
+        token
+        and t.weekday() < 5
         and time(9, 15) <= t.time() < time(15, 30)
         and exchange(token) == "NORMAL_OPEN"
     )
@@ -159,18 +168,39 @@ def stamp(x):
 
         if isinstance(x, (int, float)) or str(x).isdigit():
 
+            value = float(x)
+
+            unit = (
+                "ms"
+                if abs(value) >= 1e11
+                else "s"
+            )
+
             return pd.to_datetime(
-                float(x),
-                unit="ms",
+                value,
+                unit=unit,
                 utc=True
             ).tz_convert(IST)
 
         return pd.to_datetime(
-            x, utc=True
+            x,
+            utc=True
         ).tz_convert(IST)
 
     except Exception:
         return pd.NaT
+
+
+def recent(value, seconds):
+
+    t = stamp(value)
+
+    return bool(
+        pd.notna(t)
+        and -5 <= (
+            now() - t.to_pydatetime()
+        ).total_seconds() <= seconds
+    )
 
 
 def fresh(q, seconds=180):
@@ -180,21 +210,9 @@ def fresh(q, seconds=180):
         or q.get("timestamp")
     )
 
-    return (
+    return bool(
         pd.notna(t)
         and t.date() == now().date()
-        and -5 <= (
-            now() - t.to_pydatetime()
-        ).total_seconds() <= seconds
-    )
-
-
-def recent(value, seconds):
-
-    t = stamp(value)
-
-    return (
-        pd.notna(t)
         and -5 <= (
             now() - t.to_pydatetime()
         ).total_seconds() <= seconds
@@ -209,7 +227,7 @@ def quotes(token, keys):
 
     for i in range(0, len(keys), 40):
 
-        d = api(
+        data = api(
             "/v2/market-quote/quotes",
             token,
             {
@@ -218,9 +236,12 @@ def quotes(token, keys):
             }
         )
 
-        for q in (d or {}).values():
+        for q in (data or {}).values():
 
-            out[q.get("instrument_token")] = q
+            key = q.get("instrument_token")
+
+            if key:
+                out[key] = q
 
     return out
 
@@ -232,8 +253,10 @@ def quotes(token, keys):
 def ranking(token):
 
     m = instruments()
+
     rows = []
     errors = []
+    received = set()
 
     for i in range(0, len(m), 40):
 
@@ -253,6 +276,8 @@ def ranking(token):
 
             if k not in m:
                 continue
+
+            received.add(k)
 
             p = n(q.get("last_price"))
             prev = p - n(q.get("net_change"))
@@ -277,15 +302,18 @@ def ranking(token):
 
             pos = np.clip(
                 100 * (p - lo) / (hi - lo),
-                0, 100
+                0,
+                100
             )
 
             side = "NEUTRAL"
 
             if ch > .35 and p > op and pos >= 60:
+
                 side = "CE"
 
             elif ch < -.35 and p < op and pos <= 40:
+
                 side = "PE"
 
             score = 0
@@ -301,6 +329,7 @@ def ranking(token):
                 )
 
             rows.append({
+
                 "Symbol": m[k],
                 "Key": k,
                 "Side": side,
@@ -309,6 +338,7 @@ def ranking(token):
                 "Momentum Score": round(score, 1),
                 "Fresh": fresh(q),
                 "Volume": n(q.get("volume"))
+
             })
 
     frame = pd.DataFrame(rows)
@@ -320,7 +350,7 @@ def ranking(token):
             ascending=False
         )
 
-    return frame, len(m), errors
+    return frame, len(m), len(received), errors
 
 
 # =====================================
@@ -337,7 +367,8 @@ def parse(d):
 
             rows.append([
                 pd.to_datetime(
-                    c[0], utc=True
+                    c[0],
+                    utc=True
                 ).tz_convert(IST),
                 *map(float, c[1:6])
             ])
@@ -401,6 +432,7 @@ def raw(token, key):
     ]
 
     if not frames:
+
         raise RuntimeError("No candles")
 
     d = pd.concat(frames).sort_index()
@@ -468,8 +500,15 @@ def indicators(d):
         1 + g / l.replace(0, np.nan)
     )
 
-    d.loc[(l == 0) & (g > 0), "rsi"] = 100
-    d.loc[(l == 0) & (g == 0), "rsi"] = 50
+    d.loc[
+        (l == 0) & (g > 0),
+        "rsi"
+    ] = 100
+
+    d.loc[
+        (l == 0) & (g == 0),
+        "rsi"
+    ] = 50
 
     tr = pd.concat([
         d.high - d.low,
@@ -487,11 +526,15 @@ def indicators(d):
     dn = -d.low.diff()
 
     plus = np.where(
-        (up > dn) & (up > 0), up, 0
+        (up > dn) & (up > 0),
+        up,
+        0
     )
 
     minus = np.where(
-        (dn > up) & (dn > 0), dn, 0
+        (dn > up) & (dn > 0),
+        dn,
+        0
     )
 
     for name, arr in [
@@ -546,7 +589,9 @@ def technical(token, key):
 
     if min(len(b), len(b15), len(b60)) < 21:
 
-        raise RuntimeError("Insufficient history")
+        raise RuntimeError(
+            "Insufficient history"
+        )
 
     a = b.iloc[-1]
     h = b15.iloc[-1]
@@ -561,6 +606,7 @@ def technical(token, key):
         raise RuntimeError("Stale candle")
 
     today = b[b.index.date == cut.date()]
+
     opening = today.iloc[:3]
 
     expected = [
@@ -574,14 +620,18 @@ def technical(token, key):
         or list(opening.index.time) != expected
     ):
 
-        raise RuntimeError("Opening range missing")
+        raise RuntimeError(
+            "Opening range missing"
+        )
 
     side = "NEUTRAL"
 
     if a.close > a.ema9 > a.ema21:
+
         side = "CE"
 
     elif a.close < a.ema9 < a.ema21:
+
         side = "PE"
 
     s = 1 if side == "CE" else -1
@@ -691,7 +741,8 @@ def technical(token, key):
 # STEP 4: OPTION CHAIN AND GREEKS
 # =====================================
 
-def expiry(token, key):
+@st.cache_data(ttl=900, show_spinner=False)
+def expiry(token, key, day):
 
     d = api(
         "/v2/option/contract",
@@ -706,7 +757,7 @@ def expiry(token, key):
         for x in d
 
         if x.get("expiry", "")
-        > now().date().isoformat()
+        > day.isoformat()
     })
 
     return dates[0] if dates else None
@@ -759,19 +810,20 @@ def chain(token, key, exp):
                 "Previous OI": n(m.get("prev_oi")),
                 "Volume": n(m.get("volume")),
 
-                **{
-                    k.title(): n(g.get(k))
-                    for k in (
-                        "delta", "theta",
-                        "gamma", "vega", "iv"
-                    )
-                }
+                "Delta": n(g.get("delta")),
+                "Theta": n(g.get("theta")),
+                "Gamma": n(g.get("gamma")),
+                "Vega": n(g.get("vega")),
+                "IV": n(g.get("iv"))
+
             })
 
     if not rows:
         return pd.DataFrame()
 
-    c = pd.DataFrame(rows).dropna(subset=["Key"])
+    c = pd.DataFrame(rows).dropna(
+        subset=["Key"]
+    )
 
     c["Daily OI Change"] = (
         c.OI - c["Previous OI"]
@@ -785,10 +837,13 @@ def summary(c):
     ce = c[c.Side == "CE"]
     pe = c[c.Side == "PE"]
 
-    co = ce.OI.sum()
-    po = pe.OI.sum()
+    co = ce.OI.sum(min_count=1)
+    po = pe.OI.sum(min_count=1)
 
-    pcr = po / co if co > 0 else np.nan
+    pcr = (
+        po / co
+        if co > 0 else np.nan
+    )
 
     pain = {}
 
@@ -820,17 +875,19 @@ def summary(c):
 # SESSION STORAGE
 # =====================================
 
-for k, v in {
+DEFAULTS = {
 
     "ranking": pd.DataFrame(),
     "results": [],
     "diagnostics": [],
     "snapshots": {},
     "chains": {},
+    "chain_times": {},
     "signals": {},
     "journal": [],
     "last_scan": None,
     "coverage": "—",
+    "fresh_coverage": 0,
     "cursor": 0,
     "news_cursor": 0,
     "news": {},
@@ -840,10 +897,12 @@ for k, v in {
     "scan_count": 0,
     "deep_scanned": set(),
     "session_date": now().date()
+}
 
-}.items():
+for k, v in DEFAULTS.items():
 
     if k not in st.session_state:
+
         st.session_state[k] = v
 
 S = st.session_state
@@ -857,23 +916,17 @@ def reset_day():
     for v in S.signals.values():
 
         if v["Status"] == "ACTIVE":
-            v["Status"] = "SESSION ENDED / UNRESOLVED"
 
-    S.ranking = pd.DataFrame()
-    S.results = []
-    S.diagnostics = []
-    S.snapshots = {}
-    S.chains = {}
-    S.news = {}
-    S.news_market = {}
-    S.deep_scanned = set()
-    S.cursor = 0
-    S.news_cursor = 0
-    S.news_total = 0
-    S.news_last_scan = None
-    S.last_scan = None
-    S.scan_count = 0
-    S.coverage = "—"
+            v["Status"] = (
+                "SESSION ENDED / UNRESOLVED"
+            )
+
+    for k, v in DEFAULTS.items():
+
+        if k not in ("signals", "journal"):
+
+            S[k] = v
+
     S.session_date = now().date()
 
 
@@ -884,7 +937,7 @@ reset_day()
 # DASHBOARD SETTINGS
 # =====================================
 
-st.title("NSE F&O PRO — ALL IN ONE V3")
+st.title("NSE F&O PRO — ALL IN ONE V4")
 
 st.caption(
     "Momentum + News Scanner | "
@@ -901,7 +954,37 @@ with st.sidebar:
             "UPSTOX_ACCESS_TOKEN", ""
         ),
         type="password"
+    ).strip()
+
+    st.header("Signal Verification Mode")
+
+    mode = st.radio(
+
+        "Select Trading Research Mode",
+
+        [
+            "Technical + News",
+            "Strict Verified"
+        ],
+
+        index=0
     )
+
+    if mode == "Strict Verified":
+
+        st.info(
+            "Google News and at least one "
+            "official exchange announcement "
+            "feed are required."
+        )
+
+    else:
+
+        st.warning(
+            "Official exchange news may be "
+            "unavailable. Such signals are "
+            "marked PARTIALLY VERIFIED."
+        )
 
     st.header("Risk Management")
 
@@ -979,11 +1062,6 @@ with st.sidebar:
         value=True
     )
 
-    strict_news = st.toggle(
-        "Require Google and NSE news feeds",
-        value=True
-    )
-
     auto = st.toggle(
         "Auto scan (120 seconds)",
         value=True
@@ -992,7 +1070,9 @@ with st.sidebar:
     st.header("Navigation")
 
     page = st.radio(
+
         "Select Section",
+
         [
             "Home",
             "Market Scanner",
@@ -1045,6 +1125,7 @@ def automatic_news(symbol, side):
             "checked": now().isoformat()
         }
 
+    result["symbol"] = symbol
     result["direction"] = side
 
     S.news[symbol + "|" + side] = result
@@ -1052,23 +1133,52 @@ def automatic_news(symbol, side):
     return result
 
 
-def news_feed_ok(result):
+def verification(result):
 
     sources = result.get("sources", {})
 
-    if not strict_news:
-        return True
+    google = bool(
+        sources.get("Google News", False)
+    )
+
+    nse = bool(
+        sources.get("NSE Announcements", False)
+    )
+
+    bse = bool(
+        sources.get("BSE Announcements", False)
+    )
+
+    official = nse or bse
+
+    if not google:
+
+        return "NEWS UNVERIFIED"
 
     if result.get("symbol") in INDEXES:
 
-        return bool(
-            sources.get("Google News", False)
-        )
+        return "PARTIALLY VERIFIED"
 
-    return bool(
-        sources.get("Google News", False)
-        and sources.get("NSE Announcements", False)
-    )
+    if official:
+
+        return "FULLY VERIFIED"
+
+    return "PARTIALLY VERIFIED"
+
+
+def news_feed_ok(result):
+
+    status = verification(result)
+
+    if status == "NEWS UNVERIFIED":
+
+        return False
+
+    if mode == "Strict Verified":
+
+        return status == "FULLY VERIFIED"
+
+    return True
 
 
 def news_cycle():
@@ -1090,7 +1200,42 @@ def news_cycle():
 
     for row in result.get("results", []):
 
-        S.news_market[row["Symbol"]] = row
+        row = dict(row)
+
+        sources = row.get("Sources") or {}
+
+        if not isinstance(sources, dict):
+
+            sources = {}
+
+        row["Sources"] = sources
+
+        row["Verification"] = verification({
+
+            "symbol": row.get("Symbol"),
+
+            "sources": sources
+
+        })
+
+        if row.get("News Direction") == "NEUTRAL":
+
+            if row["Verification"] == "NEWS UNVERIFIED":
+
+                row["News Direction"] = "UNVERIFIED"
+
+            elif not (
+                sources.get("NSE Announcements")
+                or sources.get("BSE Announcements")
+            ):
+
+                row["News Direction"] = (
+                    "NO DIRECTION / PARTIAL DATA"
+                )
+
+        if row.get("Symbol"):
+
+            S.news_market[row["Symbol"]] = row
 
     S.news_cursor = result.get(
         "next_cursor", 0
@@ -1102,6 +1247,7 @@ def news_cycle():
 def news_frame():
 
     if not S.news_market:
+
         return pd.DataFrame()
 
     return pd.DataFrame(
@@ -1130,16 +1276,30 @@ def news_candidates(r):
         if direction not in (
             "CE WATCH", "PE WATCH"
         ):
+
             continue
 
         if not recent(
-            item.get("Checked"), 1800
+            item.get("Checked"),
+            1800
         ):
+
+            continue
+
+        if not news_feed_ok({
+
+            "symbol": symbol,
+
+            "sources": item.get("Sources", {})
+
+        }):
+
             continue
 
         row = lookup.get(symbol)
 
         if not row or not row.get("Fresh"):
+
             continue
 
         side = direction.split()[0]
@@ -1157,7 +1317,8 @@ def news_candidates(r):
             "Origin": "NEWS",
 
             "News Priority": (
-                points if np.isfinite(points)
+                points
+                if np.isfinite(points)
                 else 0
             )
         })
@@ -1177,6 +1338,8 @@ def news_candidates(r):
 
 def show_news(result):
 
+    status = verification(result)
+
     st.write(
         "Direction:",
         result.get("direction", "—")
@@ -1192,6 +1355,23 @@ def show_news(result):
         result.get("points", 0)
     )
 
+    if status == "FULLY VERIFIED":
+
+        st.success(
+            "FULLY VERIFIED — required feeds available"
+        )
+
+    elif status == "PARTIALLY VERIFIED":
+
+        st.warning(
+            "PARTIALLY VERIFIED — official "
+            "announcement coverage unavailable"
+        )
+
+    else:
+
+        st.error("NEWS UNVERIFIED")
+
     st.caption(
         "Checked: "
         + str(result.get("checked", "—"))
@@ -1200,23 +1380,26 @@ def show_news(result):
     sources = result.get("sources", {})
     errors = result.get("errors", {})
 
-    if sources:
+    for source in NEWS_SOURCES:
 
-        cols = st.columns(2)
+        available = sources.get(source)
 
-        for i, (source, available) in enumerate(
-            sources.items()
-        ):
+        if available is True:
 
-            cols[i % 2].write(
+            st.write(
+                "✅ " + source + " — Available"
+            )
 
-                ("✅ " if available else "⚠️ ")
-                + source
-                + (
-                    " — Available"
-                    if available
-                    else " — Unavailable"
-                )
+        elif available is False:
+
+            st.write(
+                "⚠️ " + source + " — Unavailable"
+            )
+
+        else:
+
+            st.write(
+                "➖ " + source + " — Not verified"
             )
 
     if result.get("block"):
@@ -1235,7 +1418,7 @@ def show_news(result):
 
         st.info(
             "No matching headlines returned. "
-            "Check source availability above."
+            "This does not establish absence of news."
         )
 
     for item in result.get("items", []):
@@ -1260,13 +1443,17 @@ def show_news(result):
             )
 
     failures = {
-        k: v for k, v in errors.items()
+        k: v
+        for k, v in errors.items()
         if v
     }
 
     if failures:
 
-        with st.expander("News source diagnostics"):
+        with st.expander(
+            "News source diagnostics"
+        ):
+
             st.write(failures)
 
 
@@ -1276,7 +1463,8 @@ def show_news(result):
 
 def option_setup(
     o, checks, metrics,
-    c, exp, symbol, old, news, origin
+    c, exp, symbol, old, news, origin,
+    snapshot_time
 ):
 
     q = quotes(
@@ -1365,7 +1553,9 @@ def option_setup(
     prev = old.get(o.Key)
 
     elapsed = (
-        (now() - prev["time"]).total_seconds()
+        (
+            snapshot_time - prev["time"]
+        ).total_seconds()
         if prev else 0
     )
 
@@ -1409,7 +1599,7 @@ def option_setup(
         opp.OI - oprev["OI"]
         if oprev
         and 20 <= (
-            now() - oprev["time"]
+            snapshot_time - oprev["time"]
         ).total_seconds() <= 600
         and oprev["time"].date() == now().date()
         else np.nan
@@ -1423,7 +1613,10 @@ def option_setup(
     )
 
     sl = entry - risk
-    lot = n(lot_sizes().get(o.Key))
+
+    lot = n(
+        lot_sizes().get(o.Key)
+    )
 
     if (
         not np.isfinite(lot)
@@ -1437,7 +1630,9 @@ def option_setup(
         )
 
     lots = max(
+
         0,
+
         int(
             min(
                 budget() / (risk * lot),
@@ -1510,17 +1705,21 @@ def option_setup(
     base_score = sum(
 
         w for w, v in zip(
-            weights, groups.values()
+            weights,
+            groups.values()
         )
 
         if v
     )
 
-    points = n(news.get("points", 0))
+    points = n(
+        news.get("points", 0)
+    )
 
     news_points = (
         min(10, max(0, points))
-        if np.isfinite(points) else 0
+        if np.isfinite(points)
+        else 0
     )
 
     score = round(
@@ -1528,7 +1727,7 @@ def option_setup(
         1
     )
 
-    news_ok = news_feed_ok(news)
+    verified = verification(news)
 
     safety = {
 
@@ -1542,10 +1741,21 @@ def option_setup(
 
         "Entry window": entry_window(token),
 
-        "News feed requirement": news_ok,
+        "News feed requirement": news_feed_ok(news),
 
         "News assessment recent": recent(
-            news.get("checked"), 300
+            news.get("checked"),
+            300
+        ),
+
+        "Chain snapshot recent": recent(
+            snapshot_time.isoformat(),
+            180
+        ),
+
+        "Spot candle recent": recent(
+            metrics.get("Technical Candle"),
+            600
         ),
 
         "No adverse headline detected":
@@ -1570,6 +1780,10 @@ def option_setup(
         "Expiry": exp,
         "Origin": origin,
 
+        "Verification": verified,
+
+        "Research Mode": mode,
+
         "Score": score,
 
         "Technical & Option Score":
@@ -1586,11 +1800,13 @@ def option_setup(
         "SL": round(sl, 2),
 
         "Target": round(
-            entry + rr * risk, 2
+            entry + rr * risk,
+            2
         ),
 
         "Target 2": round(
-            entry + (rr + 1) * risk, 2
+            entry + (rr + 1) * risk,
+            2
         ),
 
         "Reward / Risk": rr,
@@ -1600,11 +1816,13 @@ def option_setup(
         "Lot Size": int(lot),
 
         "Planned Risk": round(
-            lots * lot * risk, 2
+            lots * lot * risk,
+            2
         ),
 
         "Capital": round(
-            lots * lot * entry, 2
+            lots * lot * entry,
+            2
         ),
 
         "Current Premium": n(
@@ -1655,6 +1873,8 @@ def option_setup(
         "News Review": news.get("status"),
 
         "News Checked": news.get("checked"),
+
+        "Chain Checked": snapshot_time.isoformat(),
 
         "Time": now().isoformat(),
 
@@ -1735,16 +1955,19 @@ def track():
 
             v["Status"] = "SL OBSERVED"
             v["Exit Observation"] = p
+            v["Exit Time"] = now().isoformat()
 
         elif p >= v["Target"]:
 
             v["Status"] = "TARGET OBSERVED"
             v["Exit Observation"] = p
+            v["Exit Time"] = now().isoformat()
 
         elif now().time() >= time(15, 20):
 
             v["Status"] = "EOD OBSERVED"
             v["Exit Observation"] = p
+            v["Exit Time"] = now().isoformat()
 
 
 # =====================================
@@ -1755,13 +1978,18 @@ def scan():
 
     S.results = []
     S.diagnostics = []
-    S.last_scan = None
 
-    r, total, errors = ranking(token)
+    r, total, received, errors = ranking(token)
 
     S.ranking = r
 
-    S.coverage = f"{len(r)}/{total}"
+    S.coverage = f"{received}/{total}"
+
+    S.fresh_coverage = (
+        int(r.Fresh.sum())
+        if not r.empty
+        else 0
+    )
 
     S.diagnostics = list(errors)
 
@@ -1778,9 +2006,6 @@ def scan():
         return
 
     selected = news_candidates(r)
-
-    # Preserve priority for strong momentum
-    # while rotating through other candidates.
 
     for side in ("CE", "PE"):
 
@@ -1843,18 +2068,11 @@ def scan():
 
             unique[key] = row
 
-        elif (
-            unique[key]["Side"]
-            != row["Side"]
-        ):
-
-            unique[key]["Side"] = "AUTO"
-
-            unique[key]["Origin"] = (
-                "NEWS + MOMENTUM"
-            )
-
         else:
+
+            if unique[key]["Side"] != row["Side"]:
+
+                unique[key]["Side"] = "AUTO"
 
             unique[key]["Origin"] = (
                 "NEWS + MOMENTUM"
@@ -1870,12 +2088,14 @@ def scan():
         key = row["Key"]
 
         if not entry_window(token):
+
             break
 
         try:
 
             side, checks, metrics = technical(
-                token, key
+                token,
+                key
             )
 
             S.deep_scanned.add(sym)
@@ -1887,9 +2107,22 @@ def scan():
                 or row["Side"] not in ("AUTO", side)
             ):
 
-                raise RuntimeError("Trend conflict")
+                raise RuntimeError(
+                    "Trend conflict"
+                )
 
-            exp = expiry(token, key)
+            failed = [
+
+                k for k, v in checks.items()
+
+                if v is not None and not bool(v)
+            ]
+
+            exp = expiry(
+                token,
+                key,
+                now().date()
+            )
 
             if not exp:
 
@@ -1897,7 +2130,11 @@ def scan():
                     "No eligible expiry"
                 )
 
-            c = chain(token, key, exp)
+            c = chain(
+                token,
+                key,
+                exp
+            )
 
             if c.empty:
 
@@ -1905,13 +2142,22 @@ def scan():
                     "Empty option chain"
                 )
 
-            old = S.snapshots.get(key, {})
+            snapshot_time = now()
+
+            snapshot_key = key + "|" + exp
+
+            old = S.snapshots.get(
+                snapshot_key,
+                {}
+            )
 
             S.chains[sym] = c
 
-            snapshot_time = now()
+            S.chain_times[sym] = (
+                snapshot_time.isoformat()
+            )
 
-            S.snapshots[key] = {
+            S.snapshots[snapshot_key] = {
 
                 x.Key: {
 
@@ -1927,28 +2173,17 @@ def scan():
                 for _, x in c.iterrows()
             }
 
-            if not all(
-
-                bool(v)
-
-                for v in checks.values()
-
-                if v is not None
-            ):
-
-                failed = [
-
-                    k for k, v in checks.items()
-
-                    if v is not None and not v
-                ]
+            if failed:
 
                 raise RuntimeError(
 
                     "Failed: " + ", ".join(failed)
                 )
 
-            news = automatic_news(sym, side)
+            news = automatic_news(
+                sym,
+                side
+            )
 
             if news.get("block"):
 
@@ -1993,15 +2228,15 @@ def scan():
                 else (z.Delta < 0)
             ]
 
-            z["Distance"] = (
-                z.Delta.abs() - .55
-            ).abs()
-
             if z.empty:
 
                 raise RuntimeError(
                     "No eligible option"
                 )
+
+            z["Distance"] = (
+                z.Delta.abs() - .55
+            ).abs()
 
             options = z.sort_values(
 
@@ -2031,7 +2266,8 @@ def scan():
                         sym,
                         old,
                         news,
-                        row["Origin"]
+                        row["Origin"],
+                        snapshot_time
                     )
 
                     S.results.append(v)
@@ -2151,9 +2387,11 @@ def show_news_market():
         return
 
     valid = d[
+
         d["Checked"].apply(
             lambda x: recent(x, 1800)
         )
+
     ] if "Checked" in d else d.iloc[:0]
 
     st.caption(
@@ -2186,6 +2424,7 @@ def show_news_market():
                 "Symbol",
                 "Company",
                 side + " Points",
+                "Verification",
                 "Headlines",
                 "Checked"
             ]
@@ -2212,20 +2451,9 @@ def show_news_market():
 
     st.subheader("News Source Coverage")
 
-    sources = [
-
-        "Google News",
-
-        "NSE Announcements",
-
-        "NSE Bulk Deals",
-
-        "NSE Block Deals"
-    ]
-
     source_rows = []
 
-    for source in sources:
+    for source in NEWS_SOURCES:
 
         available = 0
         unavailable = 0
@@ -2238,12 +2466,15 @@ def show_news_market():
             ).get(source)
 
             if status is True:
+
                 available += 1
 
             elif status is False:
+
                 unavailable += 1
 
             else:
+
                 unknown += 1
 
         source_rows.append({
@@ -2265,6 +2496,31 @@ def show_news_market():
 
         use_container_width=True
     )
+
+    official_available = any(
+
+        item.get("Sources", {}).get(
+            "NSE Announcements"
+        )
+
+        or item.get("Sources", {}).get(
+            "BSE Announcements"
+        )
+
+        for item in S.news_market.values()
+
+        if recent(item.get("Checked"), 1800)
+    )
+
+    if not official_available:
+
+        st.warning(
+
+            "No recent successful official "
+            "announcement feed checks. "
+            "Technical + News Mode permits "
+            "partially verified research only."
+        )
 
     if S.news_last_scan:
 
@@ -2308,7 +2564,7 @@ def show_calls(opened):
 
         st.info(
             "NO TRADE / WAIT — "
-            "No fully confirmed setup"
+            "No fully confirmed technical setup"
         )
 
         return
@@ -2325,6 +2581,25 @@ def show_calls(opened):
 
                 f"{v['Side']} | {v['Expiry']}"
             )
+
+            verified = v.get(
+                "Verification",
+                "NEWS UNVERIFIED"
+            )
+
+            if verified == "FULLY VERIFIED":
+
+                st.success(
+                    "FULLY VERIFIED — required "
+                    "news feeds available at signal time"
+                )
+
+            else:
+
+                st.warning(
+                    "PARTIALLY VERIFIED — official "
+                    "news confirmation incomplete"
+                )
 
             st.caption(
 
@@ -2349,9 +2624,20 @@ def show_calls(opened):
                     v["Last Quote Check"], 180
                 )
 
+                and news_feed_ok(
+                    v.get("News Snapshot", {})
+                )
+
+                and recent(
+                    v.get("News Checked"),
+                    300
+                )
+
                 and v["Planned Risk"] <= budget()
 
                 and v["Capital"] <= capital
+
+                and v["Current Premium"] <= v["Entry"]
             )
 
             if fresh_signal:
@@ -2480,7 +2766,9 @@ def show_calls(opened):
 
                 "Signals are alternatives, "
 
-                "not simultaneous positions."
+                "not simultaneous positions. "
+
+                "Actual loss may exceed planned risk."
             )
 
 
@@ -2489,7 +2777,9 @@ def show_calls(opened):
 # =====================================
 
 @st.fragment(
-    run_every="120s" if auto else None
+    run_every="120s"
+    if auto or news_auto
+    else None
 )
 def dashboard():
 
@@ -2502,6 +2792,10 @@ def dashboard():
 
     opened = bool(
         token and open_market(token)
+    )
+
+    st.caption(
+        "Active Mode: " + mode
     )
 
     a, b, c = st.columns(3)
@@ -2547,6 +2841,8 @@ def dashboard():
         f"{now():%d-%m-%Y %H:%M:%S} IST"
 
         f" | Exchange: {status}"
+
+        f" | Fresh stock quotes: {S.fresh_coverage}"
     )
 
     left, right = st.columns(2)
@@ -2563,29 +2859,39 @@ def dashboard():
         "SCAN NEXT NEWS BATCH"
     )
 
-    # Track existing research signals first.
+    # Existing research signals.
 
     if token and (
-        clicked or (auto and opened)
+        clicked or auto
     ):
 
         try:
+
             track()
+
         except Exception as e:
+
             st.warning(
                 f"Tracking unavailable: {e}"
             )
 
-    # Independent news scanner.
-    # Manual news scanning also works on holidays.
+    # Independent news scanning.
+    # Also works outside market hours.
 
     if news_clicked or (
 
         news_auto
 
         and (
+
             clicked
-            or (auto and opened)
+
+            or S.news_last_scan is None
+
+            or not recent(
+                S.news_last_scan.isoformat(),
+                120
+            )
         )
     ):
 
@@ -2628,7 +2934,7 @@ def dashboard():
             "Enter Upstox Access Token"
         )
 
-    # Qualified calls remain above every page.
+    # Final calls on every page.
 
     show_calls(opened)
 
@@ -2644,7 +2950,8 @@ def dashboard():
         )
 
         if not recent(
-            S.last_scan.isoformat(), 180
+            S.last_scan.isoformat(),
+            180
         ):
 
             st.warning(
@@ -2778,27 +3085,31 @@ def dashboard():
 
         if token:
 
-            mapping = {
-                v: k
-                for k, v in instruments().items()
-            }
+            try:
 
-            mapping.update(INDEXES)
+                mapping = {
+                    v: k
+                    for k, v in instruments().items()
+                }
 
-            symbol = st.selectbox(
+                mapping.update(INDEXES)
 
-                "Select underlying",
+                symbol = st.selectbox(
 
-                sorted(mapping)
-            )
+                    "Select underlying",
 
-            if st.button("FETCH OPTION CHAIN"):
+                    sorted(mapping)
+                )
 
-                try:
+                if st.button("FETCH OPTION CHAIN"):
 
                     key = mapping[symbol]
 
-                    exp = expiry(token, key)
+                    exp = expiry(
+                        token,
+                        key,
+                        now().date()
+                    )
 
                     if not exp:
 
@@ -2806,7 +3117,11 @@ def dashboard():
                             "No eligible expiry"
                         )
 
-                    c = chain(token, key, exp)
+                    c = chain(
+                        token,
+                        key,
+                        exp
+                    )
 
                     if c.empty:
 
@@ -2816,9 +3131,13 @@ def dashboard():
 
                     S.chains[symbol] = c
 
-                except Exception as e:
+                    S.chain_times[symbol] = (
+                        now().isoformat()
+                    )
 
-                    st.error(str(e))
+            except Exception as e:
+
+                st.error(str(e))
 
         if not S.chains:
 
@@ -2836,16 +3155,27 @@ def dashboard():
                 a, b = st.columns(2)
 
                 a.metric(
-                    "PCR", round(pcr, 2)
+                    "PCR",
+                    round(pcr, 2)
                 )
 
                 b.metric(
-                    "Max Pain", pain
+                    "Max Pain",
+                    pain
                 )
 
                 st.caption(
-                    "Snapshot data. PCR and max pain "
-                    "are contextual, not entry signals."
+
+                    "Snapshot: "
+
+                    + str(
+                        S.chain_times.get(sym, "—")
+                    )
+                )
+
+                st.caption(
+                    "PCR and max pain are "
+                    "contextual, not entry signals."
                 )
 
                 st.dataframe(
@@ -2873,14 +3203,17 @@ def dashboard():
 
             "Google News | NSE Announcements | "
 
-            "Bulk Deals | Block Deals"
+            "BSE Announcements | Bulk Deals | Block Deals"
         )
 
         st.info(
 
             "48-hour headlines and recent deals. "
 
-            "Headline classification is rule-based."
+            "Headline classification is rule-based. "
+
+            "Feed availability does not prove "
+            "all material news has been captured."
         )
 
         try:
@@ -2913,7 +3246,8 @@ def dashboard():
                 ):
 
                     automatic_news(
-                        sym, direction
+                        sym,
+                        direction
                     )
 
         except Exception as e:
@@ -2929,6 +3263,15 @@ def dashboard():
             "companies-listing/"
 
             "corporate-filings-announcements)"
+        )
+
+        st.markdown(
+
+            "[BSE Corporate Announcements]"
+
+            "(https://www.bseindia.com/corporates/"
+
+            "ann.html)"
         )
 
         st.markdown(
@@ -2973,8 +3316,8 @@ def dashboard():
                 "market_news.csv"
             )
 
-        for ident, result in list(
-            S.news.items()
+        for ident, result in reversed(
+            list(S.news.items())
         ):
 
             with st.expander(
@@ -3026,6 +3369,117 @@ def dashboard():
                 "No signals recorded yet."
             )
 
+    # =================================
+    # STEP 7: FORWARD TESTING
+    # =================================
+
+    if page == "Backtesting":
+
+        st.header(
+            "Strategy Testing"
+        )
+
+        st.warning(
+
+            "Full historical options backtesting "
+
+            "is not implemented. Historical OI, "
+
+            "Greeks, bid/ask and news snapshots "
+
+            "are required."
+        )
+
+        st.subheader(
+            "Forward Signal Observations"
+        )
+
+        observations = [
+
+            v for v in S.signals.values()
+
+            if v["Status"] in (
+
+                "TARGET OBSERVED",
+
+                "SL OBSERVED",
+
+                "EOD OBSERVED"
+            )
+        ]
+
+        if observations:
+
+            df = flat_records(observations)
+
+            targets = sum(
+
+                v["Status"] == "TARGET OBSERVED"
+
+                for v in observations
+            )
+
+            stops = sum(
+
+                v["Status"] == "SL OBSERVED"
+
+                for v in observations
+            )
+
+            a, b, c = st.columns(3)
+
+            a.metric(
+
+                "Completed Observations",
+
+                len(observations)
+            )
+
+            b.metric(
+
+                "Targets Observed",
+
+                targets
+            )
+
+            c.metric(
+
+                "SL Observed",
+
+                stops
+            )
+
+            st.dataframe(
+
+                df,
+
+                use_container_width=True
+            )
+
+            st.download_button(
+
+                "Download Forward Observations",
+
+                df.to_csv(index=False),
+
+                "forward_observations.csv"
+            )
+
+            st.caption(
+
+                "Sampled prices, not executed trades. "
+
+                "Intraperiod SL or target touches "
+
+                "may be missed."
+            )
+
+        else:
+
+            st.info(
+                "No completed forward observations yet."
+            )
+
     with st.expander(
         "Rejected Setups / Diagnostics"
     ):
@@ -3040,123 +3494,14 @@ def dashboard():
 
         "full technical or news coverage. "
 
-        "Scan cycles may exceed 120 seconds."
+        "Scan cycles may exceed 120 seconds. "
+
+        "Fully Verified refers to required news "
+        "feed availability, not guaranteed accuracy."
     )
 
 
 dashboard()
-
-
-# =====================================
-# STEP 7: FORWARD TESTING
-# =====================================
-
-if page == "Backtesting":
-
-    st.header(
-        "Strategy Testing"
-    )
-
-    st.warning(
-
-        "Full historical options backtesting "
-
-        "is not implemented. Historical OI, "
-
-        "Greeks, bid/ask and news snapshots "
-
-        "are required."
-    )
-
-    st.subheader(
-        "Forward Signal Observations"
-    )
-
-    observations = [
-
-        v for v in S.signals.values()
-
-        if v["Status"] in (
-
-            "TARGET OBSERVED",
-
-            "SL OBSERVED",
-
-            "EOD OBSERVED"
-        )
-    ]
-
-    if observations:
-
-        df = flat_records(observations)
-
-        targets = sum(
-
-            v["Status"] == "TARGET OBSERVED"
-
-            for v in observations
-        )
-
-        stops = sum(
-
-            v["Status"] == "SL OBSERVED"
-
-            for v in observations
-        )
-
-        a, b, c = st.columns(3)
-
-        a.metric(
-
-            "Completed Observations",
-
-            len(observations)
-        )
-
-        b.metric(
-
-            "Targets Observed",
-
-            targets
-        )
-
-        c.metric(
-
-            "SL Observed",
-
-            stops
-        )
-
-        st.dataframe(
-
-            df,
-
-            use_container_width=True
-        )
-
-        st.download_button(
-
-            "Download Forward Observations",
-
-            df.to_csv(index=False),
-
-            "forward_observations.csv"
-        )
-
-        st.caption(
-
-            "Sampled prices, not executed trades. "
-
-            "Intraperiod SL or target touches "
-
-            "may be missed."
-        )
-
-    else:
-
-        st.info(
-            "No completed forward observations yet."
-        )
 
 
 # =====================================
@@ -3293,7 +3638,9 @@ st.divider()
 
 st.caption(
 
-    "NSE F&O PRO — ALL IN ONE V3 | "
+    "NSE F&O PRO — ALL IN ONE V4 | "
+
+    "Dual Verification Mode | "
 
     "Advanced News Intelligence | "
 
