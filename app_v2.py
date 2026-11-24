@@ -2,6 +2,7 @@
 import os
 import gzip
 import json
+
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from urllib.parse import quote
@@ -12,9 +13,11 @@ import requests
 import streamlit as st
 
 from news_engine import assess_news, scan_news_market
+from backtest_engine import render_backtesting
+
 
 st.set_page_config(
-    page_title="NSE F&O PRO — ALL IN ONE V4",
+    page_title="NSE F&O PRO — ALL IN ONE V5",
     page_icon="📊",
     layout="wide"
 )
@@ -42,14 +45,20 @@ NEWS_SOURCES = [
 ]
 
 
+# =====================================
+# BASIC FUNCTIONS
+# =====================================
+
 def now():
     return datetime.now(IST)
 
 
 def n(x):
+
     try:
         v = float(x)
         return v if np.isfinite(v) else np.nan
+
     except (ValueError, TypeError):
         return np.nan
 
@@ -67,6 +76,7 @@ def api(path, token, params=None):
     )
 
     if not r.ok:
+
         raise RuntimeError(
             f"Upstox HTTP {r.status_code}"
         )
@@ -120,6 +130,18 @@ def lot_sizes():
     }
 
 
+def instrument_mapping():
+
+    mapping = {
+        symbol: key
+        for key, symbol in instruments().items()
+    }
+
+    mapping.update(INDEXES)
+
+    return mapping
+
+
 # =====================================
 # MARKET STATUS
 # =====================================
@@ -139,6 +161,7 @@ def exchange(token):
         ).upper()
 
     except Exception:
+
         return "UNKNOWN"
 
 
@@ -188,6 +211,7 @@ def stamp(x):
         ).tz_convert(IST)
 
     except Exception:
+
         return pd.NaT
 
 
@@ -296,6 +320,7 @@ def ranking(token):
                 or min(p, prev, op) <= 0
                 or hi <= lo
             ):
+
                 continue
 
             ch = 100 * (p / prev - 1)
@@ -432,7 +457,6 @@ def raw(token, key):
     ]
 
     if not frames:
-
         raise RuntimeError("No candles")
 
     d = pd.concat(frames).sort_index()
@@ -937,11 +961,12 @@ reset_day()
 # DASHBOARD SETTINGS
 # =====================================
 
-st.title("NSE F&O PRO — ALL IN ONE V4")
+st.title("NSE F&O PRO — ALL IN ONE V5")
 
 st.caption(
     "Momentum + News Scanner | "
-    "Technical Analysis | Option Intelligence"
+    "Technical Analysis | Option Intelligence | "
+    "Historical Backtesting"
 )
 
 with st.sidebar:
@@ -1195,7 +1220,7 @@ def news_cycle():
     result = scan_news_market(
         symbols,
         start=S.news_cursor,
-        batch_size=news_batch
+        batch_size=new_batch_size()
     )
 
     for row in result.get("results", []):
@@ -1242,6 +1267,11 @@ def news_cycle():
     )
 
     S.news_last_scan = now()
+
+
+def new_batch_size():
+
+    return int(news_batch)
 
 
 def news_frame():
@@ -2637,7 +2667,7 @@ def show_calls(opened):
 
                 and v["Capital"] <= capital
 
-                and v["Current Premium"] <= v["Entry"]
+                and v["SL"] < v["Current Premium"] <= v["Entry"]
             )
 
             if fresh_signal:
@@ -2770,6 +2800,128 @@ def show_calls(opened):
 
                 "Actual loss may exceed planned risk."
             )
+
+
+# =====================================
+# FORWARD TESTING REPORT
+# =====================================
+
+def show_forward_observations():
+
+    st.header(
+        "Forward Signal Observations"
+    )
+
+    observations = [
+
+        v for v in S.signals.values()
+
+        if v["Status"] in (
+
+            "TARGET OBSERVED",
+
+            "SL OBSERVED",
+
+            "EOD OBSERVED"
+        )
+    ]
+
+    if observations:
+
+        df = flat_records(observations)
+
+        targets = sum(
+
+            v["Status"] == "TARGET OBSERVED"
+
+            for v in observations
+        )
+
+        stops = sum(
+
+            v["Status"] == "SL OBSERVED"
+
+            for v in observations
+        )
+
+        eod = sum(
+
+            v["Status"] == "EOD OBSERVED"
+
+            for v in observations
+        )
+
+        a, b, c = st.columns(3)
+
+        a.metric(
+
+            "Completed Observations",
+
+            len(observations)
+        )
+
+        b.metric(
+
+            "Targets Observed",
+
+            targets
+        )
+
+        c.metric(
+
+            "SL Observed",
+
+            stops
+        )
+
+        d, e = st.columns(2)
+
+        d.metric(
+
+            "EOD Observations",
+
+            eod
+        )
+
+        e.metric(
+
+            "Target Observation Rate",
+
+            f"{100 * targets / len(observations):.1f}%"
+        )
+
+        st.dataframe(
+
+            df,
+
+            use_container_width=True
+        )
+
+        st.download_button(
+
+            "Download Forward Observations",
+
+            df.to_csv(index=False),
+
+            "forward_observations.csv",
+
+            key="forward_download"
+        )
+
+        st.caption(
+
+            "Sampled prices, not executed trades. "
+
+            "Intraperiod SL or target touches "
+
+            "may be missed."
+        )
+
+    else:
+
+        st.info(
+            "No completed forward observations yet."
+        )
 
 
 # =====================================
@@ -3087,12 +3239,7 @@ def dashboard():
 
             try:
 
-                mapping = {
-                    v: k
-                    for k, v in instruments().items()
-                }
-
-                mapping.update(INDEXES)
+                mapping = instrument_mapping()
 
                 symbol = st.selectbox(
 
@@ -3370,115 +3517,25 @@ def dashboard():
             )
 
     # =================================
-    # STEP 7: FORWARD TESTING
+    # BACKTESTING PAGE INTRODUCTION
     # =================================
 
     if page == "Backtesting":
 
         st.header(
-            "Strategy Testing"
+            "Strategy Testing Centre"
         )
 
-        st.warning(
-
-            "Full historical options backtesting "
-
-            "is not implemented. Historical OI, "
-
-            "Greeks, bid/ask and news snapshots "
-
-            "are required."
+        st.info(
+            "Historical Technical Backtesting "
+            "and Forward Signal Observations "
+            "are available below."
         )
 
-        st.subheader(
-            "Forward Signal Observations"
+        st.caption(
+            "Historical testing runs separately "
+            "from the live market scanner."
         )
-
-        observations = [
-
-            v for v in S.signals.values()
-
-            if v["Status"] in (
-
-                "TARGET OBSERVED",
-
-                "SL OBSERVED",
-
-                "EOD OBSERVED"
-            )
-        ]
-
-        if observations:
-
-            df = flat_records(observations)
-
-            targets = sum(
-
-                v["Status"] == "TARGET OBSERVED"
-
-                for v in observations
-            )
-
-            stops = sum(
-
-                v["Status"] == "SL OBSERVED"
-
-                for v in observations
-            )
-
-            a, b, c = st.columns(3)
-
-            a.metric(
-
-                "Completed Observations",
-
-                len(observations)
-            )
-
-            b.metric(
-
-                "Targets Observed",
-
-                targets
-            )
-
-            c.metric(
-
-                "SL Observed",
-
-                stops
-            )
-
-            st.dataframe(
-
-                df,
-
-                use_container_width=True
-            )
-
-            st.download_button(
-
-                "Download Forward Observations",
-
-                df.to_csv(index=False),
-
-                "forward_observations.csv"
-            )
-
-            st.caption(
-
-                "Sampled prices, not executed trades. "
-
-                "Intraperiod SL or target touches "
-
-                "may be missed."
-            )
-
-        else:
-
-            st.info(
-                "No completed forward observations yet."
-            )
 
     with st.expander(
         "Rejected Setups / Diagnostics"
@@ -3502,6 +3559,118 @@ def dashboard():
 
 
 dashboard()
+
+
+# =====================================
+# STEP 7: HISTORICAL BACKTESTING V5
+# OUTSIDE AUTO REFRESH FRAGMENT
+# =====================================
+
+if page == "Backtesting":
+
+    historical_tab, forward_tab = st.tabs([
+
+        "Historical Backtesting",
+
+        "Forward Signal Observations"
+    ])
+
+    with historical_tab:
+
+        try:
+
+            universe = instrument_mapping()
+
+            render_backtesting(
+                token,
+                universe
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"Historical Backtesting Error: {e}"
+            )
+
+        st.divider()
+
+        st.subheader(
+            "Backtesting Coverage"
+        )
+
+        coverage = pd.DataFrame([
+
+            {
+                "Module": "Historical spot candles",
+                "Status": "Implemented"
+            },
+
+            {
+                "Module": "EMA / RSI / ADX / ATR",
+                "Status": "Implemented"
+            },
+
+            {
+                "Module": "Higher timeframe confirmation",
+                "Status": "Implemented"
+            },
+
+            {
+                "Module": "Technical breakout filters",
+                "Status": "Implemented"
+            },
+
+            {
+                "Module": "Historical risk simulation",
+                "Status": "Implemented"
+            },
+
+            {
+                "Module": "Actual historical option premium",
+                "Status": "Not implemented"
+            },
+
+            {
+                "Module": "Historical option chain and Greeks",
+                "Status": "Not implemented"
+            },
+
+            {
+                "Module": "Historical news verification",
+                "Status": "Not implemented"
+            },
+
+            {
+                "Module": "Complete live strategy replication",
+                "Status": "Not implemented"
+            }
+        ])
+
+        st.dataframe(
+
+            coverage,
+
+            hide_index=True,
+
+            use_container_width=True
+        )
+
+        st.warning(
+            "Technical backtesting results must "
+            "not be interpreted as actual options "
+            "trading returns."
+        )
+
+    with forward_tab:
+
+        show_forward_observations()
+
+        st.caption(
+            "Forward observations are updated "
+            "on full dashboard reruns. "
+            "Refresh the page to view the latest "
+            "completed observations."
+        )
 
 
 # =====================================
@@ -3634,15 +3803,23 @@ if page == "Trading Journal":
         )
 
 
+# =====================================
+# V5 DASHBOARD FOOTER
+# =====================================
+
 st.divider()
 
 st.caption(
 
-    "NSE F&O PRO — ALL IN ONE V4 | "
+    "NSE F&O PRO — ALL IN ONE V5 | "
 
     "Dual Verification Mode | "
 
     "Advanced News Intelligence | "
+
+    "Historical Technical Backtesting | "
+
+    "Forward Signal Tracking | "
 
     "Session-only storage | "
 
