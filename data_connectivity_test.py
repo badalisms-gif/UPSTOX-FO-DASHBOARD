@@ -6,35 +6,48 @@ import json
 import time
 import io
 import zipfile
+import re
+import math
+import uuid
+
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 st.set_page_config(
-    page_title="F&O DATA CONNECTIVITY V2",
+    page_title="F&O DATA CONNECTIVITY V3",
     page_icon="📡",
     layout="wide"
 )
 
 IST = ZoneInfo("Asia/Kolkata")
+
 NSE = "https://www.nseindia.com"
-ARCHIVE = "https://nsearchives.nseindia.com"
+ARC = "https://nsearchives.nseindia.com"
 UP = "https://api.upstox.com"
 
 HEADERS = {
-    "User-Agent": "FNO-Data-Research/2.0",
+    "User-Agent": "FNO-Data-Research/3.0",
     "Accept": "application/json, text/html, */*"
 }
 
-st.title("F&O DATA CONNECTIVITY TEST V2")
+ALLOWED_DOMAINS = (
+    "nseindia.com",
+    "nseindia.in",
+    "bseindia.com",
+    "upstox.com"
+)
+
+st.title("F&O DATA CONNECTIVITY TEST V3")
+
 st.caption(
-    "NSE DIRECT | OFFICIAL REPORTS | MCP | "
-    "UPSTOX NEWS | DATA VALIDATION"
+    "NSE DIRECT | MCP | UPSTOX | WEBSOCKET | "
+    "NEWS INTELLIGENCE | CROSS VERIFICATION"
 )
 
 st.info(
     "Read-only research. No automatic orders. "
-    "HTTP success does not prove data accuracy."
+    "Source validation is not prediction accuracy."
 )
 
 token = st.sidebar.text_input(
@@ -63,43 +76,83 @@ full_news = st.sidebar.checkbox(
     value=True
 )
 
-max_news_pages = st.sidebar.number_input(
+news_pages = st.sidebar.number_input(
     "Maximum News Pages Per Batch",
     min_value=1,
     max_value=10,
     value=3
 )
 
+enable_ws = st.sidebar.checkbox(
+    "Test Live WebSocket",
+    value=True
+)
+
+ws_seconds = st.sidebar.slider(
+    "WebSocket Sample Seconds",
+    5, 30, 15
+)
+
 results = []
 payloads = {}
-news_records = []
-quote_records = []
-report_frames = {}
+quote_rows = []
+news_rows = []
+reports = {}
+ws_rows = []
 
 def now():
     return datetime.now(IST)
 
-def parse_stamp(value):
+def safe_url(url):
+
+    try:
+        p = urlparse(url)
+        host = p.hostname or ""
+
+        return (
+            p.scheme == "https"
+            and not p.username
+            and not p.password
+            and p.port in (None, 443)
+            and any(
+                host == d
+                or host.endswith("." + d)
+                for d in ALLOWED_DOMAINS
+            )
+        )
+
+    except Exception:
+        return False
+
+def display_url(url):
+
+    p = urlparse(url)
+
+    return f"{p.scheme}://{p.hostname}{p.path}"
+
+def stamp(value):
+
     if value is None or value == "":
         return None
 
     try:
+
         if isinstance(value, (int, float)) or (
             isinstance(value, str)
             and value.isdigit()
         ):
+
             v = float(value)
-            unit = "ms" if abs(v) > 1e11 else "s"
 
             dt = pd.to_datetime(
-                v, unit=unit, utc=True
+                v,
+                unit="ms" if abs(v) > 1e11 else "s",
+                utc=True
             )
 
         else:
-            dt = pd.to_datetime(
-                value,
-                dayfirst=True
-            )
+
+            dt = pd.to_datetime(value)
 
         if pd.isna(dt):
             return None
@@ -114,8 +167,9 @@ def parse_stamp(value):
     except Exception:
         return None
 
-def age_seconds(value, checked=None):
-    dt = parse_stamp(value)
+def age(value, checked=None):
+
+    dt = stamp(value)
 
     if dt is None:
         return None
@@ -125,65 +179,62 @@ def age_seconds(value, checked=None):
     return round(
         (checked - dt.to_pydatetime())
         .total_seconds(),
-        2
+        3
     )
 
-def freshness(value):
-    dt = parse_stamp(value)
+def number(value):
 
-    if dt is None:
-        return "TIMESTAMP UNAVAILABLE"
+    try:
+        v = float(value)
+        return v if math.isfinite(v) else None
+    except Exception:
+        return None
 
-    age = age_seconds(value)
-
-    return (
-        f"{dt.strftime('%Y-%m-%d %H:%M:%S')} "
-        f"| Age {age} sec"
-    )
-
-def http_reason(code):
-    meanings = {
-        400: "Invalid request or parameters",
-        401: "Authentication required or expired",
-        403: "Access refused; authorized source needed",
-        404: "Endpoint or dated report not found",
-        429: "Rate limit; reduce request frequency",
-        500: "Source server error",
-        502: "Gateway error",
-        503: "Service temporarily unavailable",
-        504: "Gateway timeout"
-    }
-
-    return meanings.get(
-        code,
-        f"HTTP {code}"
-    )
-
-def add_result(
+def add(
     source,
     name,
-    state,
-    code="-",
+    status,
+    http="-",
     ms=0,
-    count=0,
-    stamp=None,
-    note=""
+    records=0,
+    timestamp=None,
+    note="",
+    final_url=""
 ):
+
+    dt = stamp(timestamp)
+
     results.append({
         "Source": source,
         "Data": name,
-        "Status": state,
-        "HTTP": code,
+        "Status": status,
+        "HTTP": http,
         "Response ms": ms,
-        "Records": count,
-        "Freshness": freshness(stamp),
+        "Records": records,
+        "Timestamp IST": str(dt) if dt is not None else "",
+        "Age Seconds": age(timestamp),
         "Remarks": note,
-        "Checked IST": now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        "Final URL": final_url,
+        "Checked IST": str(now())
     })
 
-def request_url(
+def http_reason(code):
+
+    return {
+        301: "Permanent redirect",
+        302: "Temporary redirect",
+        400: "Invalid parameters",
+        401: "Authentication required",
+        403: "Access refused",
+        404: "Endpoint or report not found",
+        429: "Rate limit",
+        500: "Server error",
+        502: "Gateway error",
+        503: "Unavailable",
+        504: "Gateway timeout"
+    }.get(code, f"HTTP {code}")
+
+def request(
     url,
     params=None,
     headers=None,
@@ -191,120 +242,211 @@ def request_url(
     body=None,
     timeout=15
 ):
-    start = time.perf_counter()
+
+    started = time.perf_counter()
+
+    h = dict(headers or HEADERS)
+
+    current = url
+    redirects = []
+    retries = 0
 
     try:
-        response = None
 
-        for attempt in range(2):
+        with requests.Session() as session:
 
-            response = requests.request(
-                method,
-                url,
-                params=params,
-                headers=headers or HEADERS,
-                json=body,
-                timeout=timeout,
-                allow_redirects=False
-            )
+            while True:
 
-            if response.status_code not in (
-                429, 500, 502, 503, 504
-            ):
-                break
+                if not safe_url(current):
+                    raise ValueError(
+                        "Unapproved destination"
+                    )
 
-            if attempt == 0:
-                wait = response.headers.get(
-                    "Retry-After", "2"
+                r = session.request(
+                    method,
+                    current,
+                    params=params,
+                    headers=h,
+                    json=body,
+                    timeout=timeout,
+                    allow_redirects=False
                 )
 
-                try:
-                    wait = float(wait)
-                except Exception:
-                    wait = 2
+                if r.status_code in (
+                    301, 302, 303, 307, 308
+                ):
 
-                if wait > 10:
-                    break
+                    location = r.headers.get(
+                        "Location"
+                    )
 
-                time.sleep(max(1, wait))
+                    if (
+                        not location
+                        or len(redirects) >= 4
+                        or method != "GET"
+                    ):
+                        break
 
-        ms = round(
-            (time.perf_counter() - start)
-            * 1000
+                    target = urljoin(
+                        r.url,
+                        location
+                    )
+
+                    if not safe_url(target):
+                        break
+
+                    if (
+                        urlparse(current).netloc
+                        != urlparse(target).netloc
+                    ):
+
+                        h = {
+                            k: v for k, v in h.items()
+                            if k.lower() not in (
+                                "authorization",
+                                "cookie",
+                                "mcp-session-id"
+                            )
+                        }
+
+                    redirects.append(
+                        f"{r.status_code}: "
+                        f"{display_url(target)}"
+                    )
+
+                    current = target
+                    params = None
+                    continue
+
+                if (
+                    method == "GET"
+                    and r.status_code in (
+                        429, 500, 502, 503, 504
+                    )
+                    and retries < 1
+                ):
+
+                    try:
+                        wait = float(
+                            r.headers.get(
+                                "Retry-After", "2"
+                            )
+                        )
+                    except Exception:
+                        break
+
+                    if wait <= 10:
+                        retries += 1
+                        time.sleep(max(1, wait))
+                        continue
+
+                break
+
+        return (
+            r,
+            round(
+                (time.perf_counter() - started)
+                * 1000
+            ),
+            " | ".join(redirects)
         )
 
-        return response, ms, ""
-
-    except requests.RequestException as e:
+    except Exception as e:
 
         return (
             None,
             round(
-                (time.perf_counter() - start)
+                (time.perf_counter() - started)
                 * 1000
             ),
             type(e).__name__
         )
 
-def failed(source, name, response, ms, error):
-    code = (
-        response.status_code
-        if response is not None
-        else "-"
-    )
-
-    note = (
-        http_reason(code)
-        if response is not None
-        else error
-    )
-
-    add_result(
-        source,
-        name,
-        "FAILED",
-        code,
-        ms,
-        note=note
-    )
-
-def get_json(
+def fetch(
     source,
     name,
     url,
     params=None,
-    headers=None
+    headers=None,
+    expected="json"
 ):
-    r, ms, err = request_url(
+
+    r, ms, detail = request(
         url,
         params=params,
         headers=headers
     )
 
-    if r is None or r.status_code != 200:
-        failed(source, name, r, ms, err)
-        return None, ms
+    if r is None:
 
-    try:
-        return r.json(), ms
-
-    except Exception:
-        add_result(
+        add(
             source,
             name,
-            "INVALID RESPONSE",
-            200,
-            ms,
-            note="Response is not valid JSON"
+            "FAILED",
+            ms=ms,
+            note=detail
         )
 
         return None, ms
 
-def records_from(data):
+    if r.status_code != 200:
+
+        add(
+            source,
+            name,
+            "FAILED",
+            r.status_code,
+            ms,
+            note=(
+                http_reason(r.status_code)
+                + " | " + detail
+            ),
+            final_url=display_url(r.url)
+        )
+
+        return None, ms
+
+    if expected == "html":
+
+        add(
+            source,
+            name,
+            "PAGE REACHABLE",
+            200,
+            ms,
+            note=detail,
+            final_url=display_url(r.url)
+        )
+
+        return r.text, ms
+
+    try:
+
+        data = r.json()
+
+        return data, ms
+
+    except Exception:
+
+        add(
+            source,
+            name,
+            "INVALID JSON",
+            200,
+            ms,
+            note=detail,
+            final_url=display_url(r.url)
+        )
+
+        return None, ms
+
+def rows_from(data):
+
     if isinstance(data, list):
         return data
 
     if isinstance(data, dict):
+
         rows = data.get("data", [])
 
         if isinstance(rows, list):
@@ -312,29 +454,28 @@ def records_from(data):
 
     return []
 
-def latest_stamp(rows, fields):
-    stamps = []
+def latest(rows, fields):
+
+    values = []
 
     for row in rows:
+
         if not isinstance(row, dict):
             continue
 
         for field in fields:
 
-            dt = parse_stamp(row.get(field))
+            dt = stamp(row.get(field))
 
             if dt is not None:
-                stamps.append(dt)
+                values.append(dt)
                 break
 
-    return max(stamps) if stamps else None
+    return max(values) if values else None
 
-def test_nse_list(
-    name,
-    endpoint,
-    params=None
-):
-    data, ms = get_json(
+def nse_list(name, endpoint, params=None):
+
+    data, ms = fetch(
         "NSE",
         name,
         NSE + endpoint,
@@ -345,11 +486,11 @@ def test_nse_list(
         return []
 
     rows = [
-        x for x in records_from(data)
+        x for x in rows_from(data)
         if isinstance(x, dict)
     ]
 
-    stamp = latest_stamp(
+    dt = latest(
         rows,
         [
             "an_dt",
@@ -360,7 +501,7 @@ def test_nse_list(
         ]
     )
 
-    add_result(
+    add(
         "NSE",
         name,
         "DATA RECEIVED" if rows
@@ -368,209 +509,139 @@ def test_nse_list(
         200,
         ms,
         len(rows),
-        stamp,
-        "Completeness not established"
+        dt,
+        "Completeness unverified"
     )
 
-    payloads[name] = rows[:20]
+    payloads[name] = rows
 
     return rows
 
-def test_page(source, name, url):
-    r, ms, err = request_url(url)
+def nse_quote():
 
-    if r is None or r.status_code != 200:
-        failed(source, name, r, ms, err)
-        return
-
-    add_result(
-        source,
-        name,
-        "PAGE REACHABLE",
-        200,
-        ms,
-        note="Page only; records not extracted"
-    )
-
-def test_nse_quote():
-    name = "NSE Equity Quote"
-
-    data, ms = get_json(
+    data, ms = fetch(
         "NSE",
-        name,
+        "Direct Equity Quote",
         NSE + "/api/quote-equity",
-        params={"symbol": symbol}
+        {"symbol": symbol}
     )
 
     if not isinstance(data, dict):
         return None, None
 
-    price = data.get(
-        "priceInfo", {}
-    ).get("lastPrice")
+    price = number(
+        data.get(
+            "priceInfo", {}
+        ).get("lastPrice")
+    )
 
-    stamp = data.get(
+    dt = data.get(
         "metadata", {}
     ).get("lastUpdateTime")
 
-    add_result(
+    add(
         "NSE",
-        name,
+        "Direct Equity Quote",
         "DATA RECEIVED"
-        if price is not None
+        if price is not None and price > 0
         else "INVALID DATA",
         200,
         ms,
         int(price is not None),
-        stamp,
-        f"LTP: {price}"
+        dt,
+        f"LTP {price}"
     )
 
-    return price, stamp
+    return price, dt
 
-def test_nse_chain():
-    name = "NSE NIFTY Option Chain"
+def nse_chain():
 
-    data, ms = get_json(
+    data, ms = fetch(
         "NSE",
-        name,
+        "Direct NIFTY Option Chain",
         NSE + "/api/option-chain-indices",
-        params={"symbol": "NIFTY"}
+        {"symbol": "NIFTY"}
     )
 
     if not isinstance(data, dict):
         return
 
-    records = data.get("records", {})
-    rows = records.get("data", [])
+    record = data.get("records", {})
+    rows = record.get("data", [])
 
-    add_result(
+    add(
         "NSE",
-        name,
-        "DATA RECEIVED" if rows
-        else "INVALID DATA",
+        "Direct NIFTY Option Chain",
+        "DATA RECEIVED"
+        if rows else "INVALID DATA",
         200,
         ms,
         len(rows),
-        records.get("timestamp"),
-        "Chain completeness not established"
+        record.get("timestamp")
     )
 
-def read_report(content):
+def archive(name, url, required):
 
-    if content[:2] == b"PK":
-
-        with zipfile.ZipFile(
-            io.BytesIO(content)
-        ) as z:
-
-            members = [
-                x for x in z.infolist()
-                if x.filename.lower().endswith(".csv")
-            ]
-
-            if not members:
-                raise ValueError("No CSV in archive")
-
-            if members[0].file_size > 100_000_000:
-                raise ValueError("Archive too large")
-
-            with z.open(members[0]) as file:
-                return pd.read_csv(
-                    file,
-                    low_memory=False
-                )
-
-    return pd.read_csv(
-        io.BytesIO(content),
-        low_memory=False
-    )
-
-def validate_report(df, report_type):
-
-    columns = {
-        str(c).strip().upper()
-        for c in df.columns
-    }
-
-    if df.empty:
-        return False
-
-    if report_type == "DELIVERY":
-
-        return (
-            bool(
-                columns.intersection({
-                    "SYMBOL", "TCKRSYMB"
-                })
-            )
-            and bool(
-                columns.intersection({
-                    "DELIV_QTY",
-                    "DELIV_PER",
-                    "DELIVERY QTY"
-                })
-            )
-        )
-
-    if report_type == "BULK_BLOCK":
-
-        return (
-            bool(
-                columns.intersection({
-                    "SYMBOL", "TCKRSYMB"
-                })
-            )
-            and any(
-                "CLIENT" in c
-                or "QUANTITY" in c
-                for c in columns
-            )
-        )
-
-    if report_type == "EQUITY":
-
-        return (
-            "TCKRSYMB" in columns
-            and "CLSPRIC" in columns
-            and "TRADDT" in columns
-        )
-
-    if report_type == "FO":
-
-        return (
-            "TCKRSYMB" in columns
-            and "OPNINTRST" in columns
-            and "TRADDT" in columns
-        )
-
-    return False
-
-def test_archive(name, url, report_type):
-
-    r, ms, err = request_url(
+    r, ms, detail = request(
         url,
-        timeout=30
+        timeout=25
     )
 
     if r is None or r.status_code != 200:
-        failed(
+
+        code = (
+            r.status_code
+            if r is not None else "-"
+        )
+
+        add(
             "NSE ARCHIVE",
             name,
-            r,
+            "FAILED",
+            code,
             ms,
-            err
+            note=(
+                http_reason(code)
+                if r is not None else detail
+            ),
+            final_url=display_url(r.url)
+            if r is not None else ""
         )
+
         return
 
     try:
-        df = read_report(r.content)
 
-        if not validate_report(
-            df, report_type
-        ):
-            raise ValueError(
-                "Unexpected report schema"
+        if r.content[:2] == b"PK":
+
+            with zipfile.ZipFile(
+                io.BytesIO(r.content)
+            ) as z:
+
+                members = [
+                    m for m in z.infolist()
+                    if m.filename.lower()
+                    .endswith(".csv")
+                ]
+
+                if not members:
+                    raise ValueError("No CSV")
+
+                if members[0].file_size > 100_000_000:
+                    raise ValueError("Large archive")
+
+                with z.open(members[0]) as f:
+
+                    df = pd.read_csv(
+                        f,
+                        low_memory=False
+                    )
+
+        else:
+
+            df = pd.read_csv(
+                io.BytesIO(r.content),
+                low_memory=False
             )
 
         df.columns = [
@@ -578,7 +649,16 @@ def test_archive(name, url, report_type):
             for c in df.columns
         ]
 
-        date_col = next(
+        columns = {
+            c.upper() for c in df.columns
+        }
+
+        if not set(required).issubset(columns):
+            raise ValueError("Schema mismatch")
+
+        date_note = "Report date unverified"
+
+        date_column = next(
             (
                 c for c in df.columns
                 if c.upper() == "TRADDT"
@@ -586,58 +666,60 @@ def test_archive(name, url, report_type):
             None
         )
 
-        date_note = "Report date unverified"
-
-        if date_col:
+        if date_column:
 
             dates = pd.to_datetime(
-                df[date_col],
+                df[date_column],
                 errors="coerce"
-            ).dt.date.dropna()
+            ).dt.date
 
             if (
-                len(dates) == len(df)
+                len(df) > 0
                 and dates.eq(report_date).all()
             ):
                 date_note = "Report date matches"
-
             else:
-                date_note = "DATE MISMATCH OR MISSING"
+                date_note = "DATE MISMATCH"
 
-        report_frames[name] = df
+        reports[name] = df
 
-        add_result(
+        add(
             "NSE ARCHIVE",
             name,
-            "REPORT RECEIVED",
+            "REPORT RECEIVED"
+            if len(df) else "EMPTY REPORT",
             200,
             ms,
             len(df),
-            note=(
-                f"{date_note} | "
-                f"Columns: {len(df.columns)}"
-            )
+            note=date_note + " | " + detail,
+            final_url=display_url(r.url)
         )
 
     except Exception as e:
 
-        add_result(
+        add(
             "NSE ARCHIVE",
             name,
             "INVALID REPORT",
             200,
             ms,
-            note=type(e).__name__
+            note=str(e),
+            final_url=display_url(r.url)
         )
 
-def mcp_decode(response):
+def mcp_decode(r):
 
     try:
-        return response.json()
+
+        value = r.json()
+
+        return value if isinstance(
+            value, dict
+        ) else {}
 
     except Exception:
 
-        for line in response.text.splitlines():
+        for line in r.text.splitlines():
 
             if line.startswith("data:"):
 
@@ -654,68 +736,73 @@ def mcp_decode(response):
 
     return {}
 
-def test_mcp(name, url):
+def mcp_connect(name, url):
 
-    headers = {
+    h = {
         "Content-Type": "application/json",
         "Accept": (
             "application/json, text/event-stream"
         )
     }
 
-    initial = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "fno-research",
-                "version": "2.0"
+    r, ms, detail = request(
+        url,
+        method="POST",
+        headers=h,
+        body={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "fno-research",
+                    "version": "3.0"
+                }
             }
         }
-    }
-
-    r, ms, err = request_url(
-        url,
-        headers=headers,
-        method="POST",
-        body=initial
     )
 
     if r is None or r.status_code != 200:
-        failed("NSE MCP", name, r, ms, err)
-        return
 
-    data = mcp_decode(r)
-
-    if "result" not in data:
-
-        add_result(
+        add(
             "NSE MCP",
             name,
-            "HANDSHAKE FAILED",
+            "FAILED",
+            r.status_code if r is not None else "-",
+            ms,
+            note=detail
+        )
+
+        return None, []
+
+    data = mcp_decode(r)
+    result = data.get("result")
+
+    if not isinstance(result, dict):
+
+        add(
+            "NSE MCP",
+            name,
+            "INVALID HANDSHAKE",
             200,
             ms
         )
-        return
 
-    session_id = r.headers.get(
-        "Mcp-Session-Id"
-    )
+        return None, []
 
-    if session_id:
-        headers["Mcp-Session-Id"] = session_id
+    sid = r.headers.get("Mcp-Session-Id")
 
-    version = data["result"].get(
+    if sid:
+        h["Mcp-Session-Id"] = sid
+
+    h["MCP-Protocol-Version"] = result.get(
         "protocolVersion",
         "2025-03-26"
     )
 
-    headers["MCP-Protocol-Version"] = version
-
-    add_result(
+    add(
         "NSE MCP",
         name + " Initialize",
         "HANDSHAKE OK",
@@ -723,10 +810,10 @@ def test_mcp(name, url):
         ms
     )
 
-    init_r, init_ms, init_err = request_url(
+    r, ms, detail = request(
         url,
-        headers=headers,
         method="POST",
+        headers=h,
         body={
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
@@ -734,62 +821,73 @@ def test_mcp(name, url):
     )
 
     if (
-        init_r is None
-        or init_r.status_code not in (200, 202, 204)
+        r is None
+        or r.status_code not in (200, 202, 204)
     ):
-        failed(
+
+        add(
             "NSE MCP",
             name + " Notification",
-            init_r,
-            init_ms,
-            init_err
+            "FAILED"
         )
-        return
 
-    r, ms, err = request_url(
-        url,
-        headers=headers,
-        method="POST",
-        body={
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {}
-        }
-    )
+        return None, []
 
-    if r is None or r.status_code != 200:
-        failed(
-            "NSE MCP",
-            name + " Tools",
-            r,
-            ms,
-            err
+    all_tools = []
+    cursor = None
+    complete = False
+
+    for page in range(5):
+
+        params = (
+            {"cursor": cursor}
+            if cursor else {}
         )
-        return
 
-    data = mcp_decode(r)
+        r, ms, detail = request(
+            url,
+            method="POST",
+            headers=h,
+            body={
+                "jsonrpc": "2.0",
+                "id": page + 2,
+                "method": "tools/list",
+                "params": params
+            }
+        )
 
-    tools = data.get(
-        "result", {}
-    ).get("tools", [])
+        if r is None or r.status_code != 200:
+            break
 
-    payloads[name + " Tools"] = tools
+        result = mcp_decode(r).get(
+            "result", {}
+        )
 
-    add_result(
+        all_tools.extend(
+            result.get("tools", [])
+        )
+
+        cursor = result.get("nextCursor")
+
+        if not cursor:
+            complete = True
+            break
+
+    payloads[name + " Tools"] = all_tools
+
+    add(
         "NSE MCP",
         name + " Tools",
         "TOOLS DISCOVERED"
-        if tools
-        else "TOOLS UNAVAILABLE",
-        200,
-        ms,
-        len(tools),
+        if all_tools else "FAILED",
+        records=len(all_tools),
         note=(
-            "Market queries not executed; "
-            "tool schema inspection required"
+            "Discovery complete"
+            if complete else "Partial discovery"
         )
     )
+
+    return h, all_tools
 
 def load_master():
 
@@ -799,88 +897,94 @@ def load_master():
         "exchange/NSE.json.gz"
     )
 
-    r, ms, err = request_url(
+    r, ms, detail = request(
         url,
         timeout=30
     )
 
     if r is None or r.status_code != 200:
 
-        failed(
+        add(
             "UPSTOX",
             "Instrument Master",
-            r,
-            ms,
-            err
+            "FAILED",
+            r.status_code if r is not None else "-",
+            ms
         )
 
-        return {}, []
+        return {}
 
     try:
-        instruments = json.loads(
+
+        raw = (
             gzip.decompress(r.content)
+            if r.content[:2] == b"\x1f\x8b"
+            else r.content
         )
 
-        options = [
+        instruments = json.loads(raw)
+
+        option_rows = [
             x for x in instruments
             if x.get("segment") == "NSE_FO"
             and x.get("instrument_type")
-            in ["CE", "PE"]
+            in ("CE", "PE")
         ]
 
-        underlyings = {
+        underlying = {
             x.get("underlying_key")
-            for x in options
-            if x.get("underlying_key")
+            for x in option_rows
         }
 
         equities = {
-            x["instrument_key"]:
-            x.get("trading_symbol")
+            x["instrument_key"]: {
+                "symbol": x.get("trading_symbol"),
+                "name": x.get("name", "")
+            }
             for x in instruments
             if x.get("segment") == "NSE_EQ"
             and x.get("instrument_key")
-            in underlyings
+            in underlying
         }
 
-        add_result(
+        add(
             "UPSTOX",
             "F&O Instrument Master",
             "DATA RECEIVED",
             200,
             ms,
             len(equities),
-            note=f"Option contracts: {len(options)}"
+            note=(
+                f"Option contracts "
+                f"{len(option_rows)}"
+            )
         )
 
-        return equities, options
+        return equities
 
-    except Exception as e:
+    except Exception:
 
-        add_result(
+        add(
             "UPSTOX",
             "Instrument Master",
-            "INVALID DATA",
-            200,
-            ms,
-            note=type(e).__name__
+            "INVALID DATA"
         )
 
-        return {}, []
+        return {}
 
-def quote_batch(keys, auth, name):
+def get_quotes(keys, auth, name):
 
-    data, ms = get_json(
+    data, ms = fetch(
         "UPSTOX",
         name,
         UP + "/v2/market-quote/quotes",
-        params={
+        {
             "instrument_key": ",".join(keys)
         },
-        headers=auth
+        auth
     )
 
-    if data is None:
+    if not isinstance(data, dict):
         return {}
 
     rows = data.get("data", {})
@@ -889,75 +993,92 @@ def quote_batch(keys, auth, name):
         data.get("status") != "success"
         or not isinstance(rows, dict)
     ):
-        add_result(
+
+        add(
             "UPSTOX",
             name,
             "INVALID DATA",
             200,
             ms
         )
+
         return {}
 
-    result = {}
+    found = {}
+
+    checked = now()
 
     for row in rows.values():
 
-        key = row.get("instrument_token")
-
-        if key not in keys:
+        if not isinstance(row, dict):
             continue
 
-        stamp = row.get("last_trade_time")
+        key = row.get("instrument_token")
+        price = number(row.get("last_price"))
 
-        age = age_seconds(stamp)
+        if (
+            key not in keys
+            or price is None
+            or price <= 0
+        ):
+            continue
 
-        result[key] = row
+        found[key] = row
 
-        quote_records.append({
+        last_trade = row.get("last_trade_time")
+
+        a = age(
+            last_trade,
+            checked
+        )
+
+        quote_rows.append({
             "Instrument": key,
-            "LTP": row.get("last_price"),
-            "Last Trade": str(parse_stamp(stamp)),
-            "Last Trade Age Seconds": age,
-            "Within 5 Seconds": (
-                age is not None
-                and 0 <= age <= 5
+            "LTP": price,
+            "Last Trade IST": str(
+                stamp(last_trade)
             ),
-            "Checked IST": str(now())
+            "Last Trade Age Seconds": a,
+            "Within 5 Seconds": (
+                a is not None
+                and 0 <= a <= 5
+            ),
+            "Response ms": ms,
+            "Checked IST": str(checked)
         })
 
-    add_result(
+    add(
         "UPSTOX",
         name,
-        "DATA RECEIVED" if result
+        "DATA RECEIVED" if found
         else "EMPTY",
         200,
         ms,
-        len(result),
-        note=f"Received {len(result)}/{len(keys)}"
+        len(found),
+        note=f"{len(found)}/{len(keys)}"
     )
 
-    return result
+    return found
 
-def test_option_chain(key, auth):
+def option_chain(key, auth):
 
-    data, ms = get_json(
+    data, ms = fetch(
         "UPSTOX",
         "Option Contracts",
         UP + "/v2/option/contract",
-        params={"instrument_key": key},
-        headers=auth
+        {"instrument_key": key},
+        auth
     )
 
-    if data is None:
+    if not isinstance(data, dict):
         return
 
-    rows = records_from(data)
+    rows = rows_from(data)
 
-    add_result(
+    add(
         "UPSTOX",
         "Option Contracts",
-        "DATA RECEIVED" if rows
-        else "EMPTY",
+        "DATA RECEIVED" if rows else "EMPTY",
         200,
         ms,
         len(rows)
@@ -973,112 +1094,364 @@ def test_option_chain(key, auth):
     if not expiries:
         return
 
-    data, ms = get_json(
+    data, ms = fetch(
         "UPSTOX",
         "Option Chain",
         UP + "/v2/option/chain",
-        params={
+        {
             "instrument_key": key,
             "expiry_date": expiries[0]
         },
-        headers=auth
+        auth
     )
 
-    if data is None:
+    if not isinstance(data, dict):
         return
 
-    rows = records_from(data)
-    valid_greeks = 0
-    valid_oi = 0
-    total_legs = 0
+    rows = rows_from(data)
+
+    legs = 0
+    valid = 0
+    oi_valid = 0
+    quote_valid = 0
 
     for row in rows:
 
-        for side in [
-            "call_options", "put_options"
-        ]:
+        for side in (
+            "call_options",
+            "put_options"
+        ):
 
-            leg = row.get(side, {})
+            leg = row.get(side) or {}
 
             if not leg:
                 continue
 
-            total_legs += 1
+            legs += 1
 
-            market = leg.get(
-                "market_data", {}
-            )
+            market = leg.get("market_data") or {}
+            g = leg.get("option_greeks") or {}
 
-            greeks = leg.get(
-                "option_greeks", {}
-            )
+            delta = number(g.get("delta"))
+            iv = number(g.get("iv"))
+            gamma = number(g.get("gamma"))
+            vega = number(g.get("vega"))
+            theta = number(g.get("theta"))
 
-            if market.get("oi") is not None:
-                valid_oi += 1
-
-            if all(
-                greeks.get(k) is not None
-                for k in [
-                    "delta", "theta",
-                    "gamma", "vega", "iv"
-                ]
+            if (
+                delta is not None
+                and abs(delta) <= 1
+                and (
+                    delta >= 0
+                    if side == "call_options"
+                    else delta <= 0
+                )
+                and iv is not None
+                and iv > 0
+                and gamma is not None
+                and gamma >= 0
+                and vega is not None
+                and vega >= 0
+                and theta is not None
             ):
-                valid_greeks += 1
 
-    add_result(
+                valid += 1
+
+            oi = number(market.get("oi"))
+
+            if oi is not None and oi >= 0:
+                oi_valid += 1
+
+            bid = number(
+                market.get("bid_price")
+            )
+
+            ask = number(
+                market.get("ask_price")
+            )
+
+            if (
+                bid is not None
+                and ask is not None
+                and 0 < bid <= ask
+            ):
+                quote_valid += 1
+
+    payloads["Upstox Option Chain"] = rows
+
+    add(
         "UPSTOX",
-        "Option Chain and Greeks",
-        "DATA RECEIVED" if rows
-        else "EMPTY",
+        "Option Chain Quality",
+        "DATA RECEIVED" if rows else "EMPTY",
         200,
         ms,
         len(rows),
         note=(
             f"Expiry {expiries[0]} | "
-            f"OI {valid_oi}/{total_legs} | "
-            f"Greeks {valid_greeks}/{total_legs} | "
-            "Freshness and numeric accuracy unverified"
+            f"Numeric Greeks {valid}/{legs} | "
+            f"OI {oi_valid}/{legs} | "
+            f"Bid Ask {quote_valid}/{legs} | "
+            "Feed timestamp unavailable"
         )
     )
 
-    payloads["Upstox Option Chain"] = rows[:3]
+def cross_verify(nse_price, nse_time, quote):
 
-def test_news(equities, keys, auth):
+    if (
+        nse_price is None
+        or nse_price <= 0
+        or not quote
+    ):
 
-    successful_keys = set()
-    partial_batches = 0
-    complete_batches = 0
-    total_batches = 0
+        add(
+            "CROSS CHECK",
+            "NSE vs Upstox Price",
+            "UNAVAILABLE",
+            note="Both sources required"
+        )
 
-    for i in range(0, len(keys), 30):
+        return
 
-        batch = keys[i:i + 30]
-        total_batches += 1
-        batch_complete = False
+    a = stamp(nse_time)
+
+    b = stamp(
+        quote.get("last_trade_time")
+    )
+
+    p = number(quote.get("last_price"))
+
+    if (
+        a is None
+        or b is None
+        or p is None
+        or p <= 0
+    ):
+
+        add(
+            "CROSS CHECK",
+            "NSE vs Upstox Price",
+            "UNVERIFIED"
+        )
+
+        return
+
+    gap = abs((a - b).total_seconds())
+
+    difference = (
+        abs(nse_price - p)
+        / nse_price * 100
+    )
+
+    add(
+        "CROSS CHECK",
+        "NSE vs Upstox Price",
+        "COMPARABLE SAMPLE"
+        if gap <= 2
+        else "NOT SYNCHRONIZED",
+        note=(
+            f"NSE {nse_price} | "
+            f"Upstox {p} | "
+            f"Difference {difference:.4f}% | "
+            f"Time gap {gap:.2f}s"
+        )
+    )
+
+def normalize(text):
+
+    text = str(text or "").lower()
+
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        text
+    ).strip()
+
+ALIASES = {
+    "LT": ["larsen and toubro", "l&t"],
+    "DIXON": ["dixon technologies", "dixon"],
+    "INFY": ["infosys"],
+    "TCS": ["tata consultancy services", "tcs"],
+    "RELIANCE": ["reliance industries"],
+    "SBIN": ["state bank of india", "sbi"],
+    "HDFCBANK": ["hdfc bank"],
+    "ICICIBANK": ["icici bank"],
+    "POLICYBZR": ["pb fintech", "policybazaar"],
+    "APLAPOLLO": ["apl apollo"],
+    "CIPLA": ["cipla"],
+    "MARUTI": ["maruti suzuki"],
+    "HYUNDAI": ["hyundai motor india"],
+    "TATASTEEL": ["tata steel"],
+    "SUNPHARMA": ["sun pharmaceutical"],
+    "ZYDUSLIFE": ["zydus lifesciences"]
+}
+
+def company_relevance(
+    name,
+    sym,
+    heading,
+    summary
+):
+
+    aliases = list(
+        ALIASES.get(sym, [])
+    )
+
+    company = normalize(name)
+
+    company = re.sub(
+        r"\b(limited|ltd|private|pvt)\b",
+        "",
+        company
+    ).strip()
+
+    if len(company) >= 5:
+        aliases.append(company)
+
+    if len(sym) >= 4:
+        aliases.append(sym)
+
+    title = normalize(heading)
+    body = normalize(summary)
+
+    for alias in aliases:
+
+        alias = normalize(alias)
+
+        if len(alias) < 3:
+            continue
+
+        pattern = (
+            r"\b"
+            + re.escape(alias)
+            + r"\b"
+        )
+
+        if re.search(pattern, title):
+
+            return "TITLE MATCH", alias
+
+    for alias in aliases:
+
+        alias = normalize(alias)
+
+        if len(alias) < 3:
+            continue
+
+        if re.search(
+            r"\b" + re.escape(alias) + r"\b",
+            body
+        ):
+
+            return "BODY MATCH", alias
+
+    return "UNCONFIRMED MAPPING", ""
+
+EVENTS = {
+    "ORDER / CONTRACT": [
+        "wins order",
+        "bagged order",
+        "new order",
+        "contract awarded",
+        "order win"
+    ],
+    "REGULATORY": [
+        "sebi",
+        "rbi",
+        "usfda",
+        "regulatory",
+        "approval",
+        "penalty"
+    ],
+    "EARNINGS": [
+        "quarterly results",
+        "net profit",
+        "revenue",
+        "earnings",
+        "margin"
+    ],
+    "DEBT": [
+        "debt",
+        "default",
+        "insolvency",
+        "credit rating"
+    ],
+    "CORPORATE ACTION": [
+        "buyback",
+        "dividend",
+        "stock split",
+        "merger",
+        "acquisition"
+    ],
+    "PRICE MOVEMENT": [
+        "shares rise",
+        "shares fall",
+        "stock jumps",
+        "stock falls",
+        "52 week high",
+        "52 week low"
+    ]
+}
+
+def event_type(heading, summary):
+
+    content = normalize(
+        str(heading or "")
+        + " "
+        + str(summary or "")
+    )
+
+    matched = []
+
+    for event, terms in EVENTS.items():
+
+        if any(
+            normalize(term) in content
+            for term in terms
+        ):
+
+            matched.append(event)
+
+    return (
+        " | ".join(matched)
+        if matched else "UNCLASSIFIED"
+    )
+
+def news_test(equities, keys, auth):
+
+    successful = 0
+    completed = 0
+    attempted = 0
+
+    for start in range(0, len(keys), 30):
+
+        batch = keys[start:start + 30]
+        attempted += 1
+
+        batch_ok = False
 
         for page in range(
-            1, int(max_news_pages) + 1
+            1, int(news_pages) + 1
         ):
 
             name = (
-                f"News Batch {total_batches}"
-                f" Page {page}"
+                f"Batch {attempted} "
+                f"Page {page}"
             )
 
-            data, ms = get_json(
+            data, ms = fetch(
                 "UPSTOX NEWS",
                 name,
                 UP + "/v2/news",
-                params={
+                {
                     "category": "instrument_keys",
                     "instrument_keys": ",".join(batch),
                     "page_number": page,
                     "page_size": 100
                 },
-                headers=auth
+                auth
             )
 
-            if data is None:
+            if not isinstance(data, dict):
                 break
 
             mapping = data.get("data", {})
@@ -1088,19 +1461,18 @@ def test_news(equities, keys, auth):
                 or not isinstance(mapping, dict)
             ):
 
-                add_result(
+                add(
                     "UPSTOX NEWS",
                     name,
-                    "INVALID RESPONSE",
-                    200,
-                    ms
+                    "INVALID RESPONSE"
                 )
+
                 break
 
-            successful_keys.update(batch)
+            batch_ok = True
 
             count = 0
-            stamps = []
+            dates = []
 
             for key, articles in mapping.items():
 
@@ -1110,297 +1482,490 @@ def test_news(equities, keys, auth):
                 ):
                     continue
 
+                instrument = equities.get(key, {})
+
+                sym = instrument.get(
+                    "symbol", key
+                )
+
+                company = instrument.get(
+                    "name", ""
+                )
+
                 for article in articles:
 
-                    stamp = article.get(
+                    if not isinstance(article, dict):
+                        continue
+
+                    heading = article.get(
+                        "heading", ""
+                    )
+
+                    summary = article.get(
+                        "summary", ""
+                    )
+
+                    published = article.get(
                         "published_time"
                     )
 
-                    dt = parse_stamp(stamp)
+                    dt = stamp(published)
 
                     if dt is not None:
-                        stamps.append(dt)
+                        dates.append(dt)
+
+                    relevance, matched = (
+                        company_relevance(
+                            company,
+                            sym,
+                            heading,
+                            summary
+                        )
+                    )
+
+                    news_rows.append({
+                        "Symbol": sym,
+                        "Instrument": key,
+                        "Heading": heading,
+                        "Summary": summary,
+                        "Published IST": str(dt),
+                        "Age Seconds": age(published),
+                        "URL": article.get(
+                            "article_link", ""
+                        ),
+                        "Company Relevance": relevance,
+                        "Matched Alias": matched,
+                        "Event Type": event_type(
+                            heading,
+                            summary
+                        ),
+                        "Directional Impact": (
+                            "REVIEW REQUIRED"
+                        )
+                    })
 
                     count += 1
 
-                    news_records.append({
-                        "Symbol": equities.get(key, key),
-                        "Instrument": key,
-                        "Heading": article.get("heading"),
-                        "Summary": article.get("summary"),
-                        "Published IST": (
-                            str(dt) if dt is not None
-                            else "UNVERIFIED"
-                        ),
-                        "Age Seconds": age_seconds(stamp),
-                        "URL": article.get("article_link")
-                    })
-
-            meta = data.get(
+            metadata = data.get(
                 "metadata", {}
-            ).get("page", {})
+            )
 
-            pages = meta.get("total_pages")
+            pages = metadata.get(
+                "page", {}
+            ).get("total_pages")
 
-            add_result(
+            add(
                 "UPSTOX NEWS",
                 name,
-                "DATA RECEIVED" if count
-                else "NO ARTICLES RETURNED",
+                "DATA RECEIVED"
+                if count else "NO ARTICLES",
                 200,
                 ms,
                 count,
-                max(stamps) if stamps else None,
-                f"Reported total pages: {pages}"
+                max(dates) if dates else None,
+                f"Reported pages {pages}"
             )
 
-            if pages is not None:
+            if pages is None:
+                break
 
-                try:
-                    if page >= int(pages):
-                        batch_complete = True
-                        break
+            try:
 
-                except Exception:
+                if page >= int(pages):
+                    completed += 1
                     break
 
-            else:
+            except Exception:
                 break
 
             time.sleep(0.3)
 
-        if batch_complete:
-            complete_batches += 1
-        else:
-            partial_batches += 1
+        if batch_ok:
+            successful += len(batch)
 
         time.sleep(0.3)
 
-    add_result(
+    add(
         "UPSTOX NEWS",
-        "News API Coverage",
+        "News Coverage",
         "COMPLETE REQUESTS"
-        if complete_batches == total_batches
+        if completed == attempted
         else "PARTIAL / UNVERIFIED",
-        count=len(news_records),
+        records=len(news_rows),
         note=(
-            f"Successful requests for "
-            f"{len(successful_keys)}/{len(keys)} keys | "
-            f"Completed batches {complete_batches} | "
-            f"Partial batches {partial_batches} | "
-            "Does not establish complete news coverage"
+            f"Successful request keys "
+            f"{successful}/{len(keys)} | "
+            f"Completed batches "
+            f"{completed}/{attempted}"
         )
     )
 
-def compare_prices(
-    nse_price,
-    nse_stamp,
-    up_quote
-):
-
-    if nse_price is None or not up_quote:
-
-        add_result(
-            "CROSS CHECK",
-            symbol + " Price Comparison",
-            "UNAVAILABLE",
-            note="Both sources required"
-        )
-
-        return
-
-    up_price = up_quote.get("last_price")
-    up_stamp = up_quote.get("last_trade_time")
-
-    a = parse_stamp(nse_stamp)
-    b = parse_stamp(up_stamp)
-
-    if a is None or b is None:
-
-        add_result(
-            "CROSS CHECK",
-            symbol + " Price Comparison",
-            "TIMESTAMP UNVERIFIED"
-        )
-        return
+def websocket_test(keys, auth):
 
     try:
 
-        nse_price = float(nse_price)
-        up_price = float(up_price)
+        import websocket
 
-        if nse_price <= 0 or up_price <= 0:
-            raise ValueError("Invalid price")
+        from upstox_client.feeder.proto \
+            import MarketDataFeedV3_pb2 as pb
 
-        time_gap = abs(
-            (a - b).total_seconds()
-        )
+    except ImportError:
 
-        diff = abs(
-            nse_price - up_price
-        )
-
-        pct = diff / nse_price * 100
-
-        add_result(
-            "CROSS CHECK",
-            symbol + " Price Comparison",
-            "COMPARABLE SAMPLE"
-            if time_gap <= 2
-            else "NOT SYNCHRONIZED",
+        add(
+            "WEBSOCKET",
+            "Live Stream",
+            "DEPENDENCY MISSING",
             note=(
-                f"NSE {nse_price} | "
-                f"Upstox {up_price} | "
-                f"Difference {pct:.4f}% | "
-                f"Timestamp gap {time_gap:.2f}s"
+                "Install websocket-client "
+                "and current upstox-python-sdk"
             )
         )
 
-    except Exception:
+        return
 
-        add_result(
-            "CROSS CHECK",
-            symbol + " Price Comparison",
-            "INVALID DATA"
+    data, ms = fetch(
+        "UPSTOX",
+        "WebSocket Authorization",
+        UP + "/v3/feed/market-data-feed/authorize",
+        headers=auth
+    )
+
+    if not isinstance(data, dict):
+        return
+
+    uri = data.get(
+        "data", {}
+    ).get(
+        "authorized_redirect_uri"
+    )
+
+    if not uri:
+
+        add(
+            "WEBSOCKET",
+            "Authorization",
+            "INVALID RESPONSE"
         )
 
-st.subheader("Data Source Testing")
+        return
 
-st.write(
-    "Official NSE files, NSE announcements, "
-    "MCP tools, Upstox quotes, news and Greeks."
-)
+    parsed = urlparse(uri)
+
+    host = parsed.hostname or ""
+
+    if not (
+        parsed.scheme == "wss"
+        and (
+            host == "upstox.com"
+            or host.endswith(".upstox.com")
+        )
+        and not parsed.username
+        and not parsed.password
+    ):
+
+        add(
+            "WEBSOCKET",
+            "Authorization",
+            "UNAPPROVED DESTINATION"
+        )
+
+        return
+
+    ws = None
+
+    packets = 0
+    live_packets = 0
+    received = set()
+    live_keys = set()
+
+    try:
+
+        started = time.perf_counter()
+
+        ws = websocket.create_connection(
+            uri,
+            timeout=5
+        )
+
+        connected_ms = round(
+            (
+                time.perf_counter()
+                - started
+            ) * 1000
+        )
+
+        ws.send_binary(
+            json.dumps({
+                "guid": str(uuid.uuid4()),
+                "method": "sub",
+                "data": {
+                    "mode": "ltpc",
+                    "instrumentKeys": keys
+                }
+            }).encode("utf-8")
+        )
+
+        end = (
+            time.monotonic()
+            + ws_seconds
+        )
+
+        while time.monotonic() < end:
+
+            ws.settimeout(
+                min(
+                    2,
+                    max(
+                        0.1,
+                        end - time.monotonic()
+                    )
+                )
+            )
+
+            try:
+                raw = ws.recv()
+
+            except websocket.WebSocketTimeoutException:
+                continue
+
+            checked = now()
+
+            if not isinstance(
+                raw, (bytes, bytearray)
+            ):
+                continue
+
+            response = pb.FeedResponse()
+            response.ParseFromString(raw)
+
+            packets += 1
+
+            packet_type = int(response.type)
+
+            if packet_type == 1:
+                live_packets += 1
+
+            current_ts = int(
+                response.currentTs
+            )
+
+            for key, feed in response.feeds.items():
+
+                if key not in keys:
+                    continue
+
+                if not feed.HasField("ltpc"):
+                    continue
+
+                ltpc = feed.ltpc
+
+                if ltpc.ltp <= 0:
+                    continue
+
+                received.add(key)
+
+                if packet_type == 1:
+                    live_keys.add(key)
+
+                ws_rows.append({
+                    "Instrument": key,
+                    "Packet Type": packet_type,
+                    "LTP": ltpc.ltp,
+                    "Last Trade IST": str(
+                        stamp(ltpc.ltt)
+                    ),
+                    "Last Trade Age Seconds": age(
+                        ltpc.ltt,
+                        checked
+                    ),
+                    "Feed Timestamp IST": str(
+                        stamp(current_ts)
+                        if current_ts else None
+                    ),
+                    "Feed Age Seconds": age(
+                        current_ts,
+                        checked
+                    ) if current_ts else None,
+                    "Received IST": str(checked)
+                })
+
+        add(
+            "WEBSOCKET",
+            "Live Stream Sample",
+            "LIVE MESSAGES RECEIVED"
+            if live_keys else "NO LIVE UPDATES OBSERVED",
+            ms=connected_ms,
+            records=len(ws_rows),
+            note=(
+                f"Packets {packets} | "
+                f"Live packets {live_packets} | "
+                f"Keys received "
+                f"{len(received)}/{len(keys)} | "
+                f"Live keys {len(live_keys)} | "
+                f"Sample {ws_seconds}s"
+            )
+        )
+
+    except Exception as e:
+
+        add(
+            "WEBSOCKET",
+            "Live Stream Sample",
+            "FAILED / PARTIAL",
+            records=len(ws_rows),
+            note=type(e).__name__
+        )
+
+    finally:
+
+        if ws is not None:
+
+            try:
+                ws.close(timeout=1)
+            except Exception:
+                pass
+
+st.subheader("Complete Source Validation")
 
 if st.button(
-    "RUN COMPLETE V2 DATA TEST",
+    "RUN COMPLETE V3 DATA TEST",
     type="primary"
 ):
 
-    progress = st.progress(0)
     status = st.empty()
+    progress = st.progress(0)
 
     status.write("Testing NSE direct sources...")
 
-    test_page(
+    fetch(
         "NSE",
         "Official Website",
-        NSE
+        NSE,
+        expected="html"
     )
 
-    announcements = test_nse_list(
+    nse_list(
         "Corporate Announcements",
         "/api/corporate-announcements",
         {"index": "equities"}
     )
 
-    nse_price, nse_stamp = test_nse_quote()
+    nse_price, nse_time = nse_quote()
 
-    test_nse_chain()
+    nse_chain()
 
-    preopen = test_nse_list(
+    nse_list(
         "Pre Open Data",
         "/api/market-data-pre-open",
         {"key": "FO"}
     )
 
-    test_nse_list(
+    nse_list(
         "Direct Bulk Deals",
         "/api/bulk-deals"
     )
 
-    test_nse_list(
+    nse_list(
         "Direct Block Deals",
         "/api/block-deals"
     )
 
     progress.progress(20)
 
-    status.write("Testing official NSE reports...")
+    status.write("Testing official NSE archives...")
 
-    test_page(
+    fetch(
         "NSE",
         "Official Reports",
-        NSE + "/all-reports"
+        NSE + "/all-reports",
+        expected="html"
     )
 
-    test_page(
+    fetch(
         "NSE",
-        "Bulk Block Deals Report Page",
+        "Bulk Block Deals Page",
         NSE + "/report-detail/"
-        "display-bulk-and-block-deals"
+        "display-bulk-and-block-deals",
+        expected="html"
     )
 
-    test_page(
+    fetch(
         "BSE",
         "Announcements Page",
         "https://www.bseindia.com/"
-        "corporates/ann.html"
+        "corporates/ann.html",
+        expected="html"
     )
 
     d = report_date.strftime("%Y%m%d")
     d2 = report_date.strftime("%d%m%Y")
 
-    test_archive(
-        "Security Deliverable Data",
-        ARCHIVE + "/products/content/"
+    archive(
+        "NSE Delivery",
+        ARC + "/products/content/"
         f"sec_bhavdata_full_{d2}.csv",
-        "DELIVERY"
+        ["SYMBOL", "DELIV_QTY"]
     )
 
-    test_archive(
-        "CM UDiFF Bhavcopy",
-        ARCHIVE + "/content/cm/"
+    archive(
+        "NSE Equity Bhavcopy",
+        ARC + "/content/cm/"
         f"BhavCopy_NSE_CM_0_0_0_{d}_"
         "F_0000.csv.zip",
-        "EQUITY"
+        ["TCKRSYMB", "TRADDT", "CLSPRIC"]
     )
 
-    test_archive(
-        "FO UDiFF Bhavcopy",
-        ARCHIVE + "/content/fo/"
+    archive(
+        "NSE FO Bhavcopy",
+        ARC + "/content/fo/"
         f"BhavCopy_NSE_FO_0_0_0_{d}_"
         "F_0000.csv.zip",
-        "FO"
+        ["TCKRSYMB", "TRADDT", "OPNINTRST"]
     )
 
-    test_archive(
-        "Bulk Deals Archive Candidate",
-        ARCHIVE + "/content/equities/"
+    archive(
+        "Bulk Deals Candidate",
+        ARC + "/content/equities/"
         f"bulk_{d2}.csv",
-        "BULK_BLOCK"
+        ["SYMBOL", "CLIENT NAME"]
     )
 
-    test_archive(
-        "Block Deals Archive Candidate",
-        ARCHIVE + "/content/equities/"
+    archive(
+        "Block Deals Candidate",
+        ARC + "/content/equities/"
         f"block_{d2}.csv",
-        "BULK_BLOCK"
+        ["SYMBOL", "CLIENT NAME"]
     )
 
     progress.progress(40)
 
-    status.write("Testing NSE MCP tools...")
+    status.write("Discovering NSE MCP tools...")
 
-    test_mcp(
-        "Bhavcopy MCP",
-        "https://mcp.nseindia.in/bhavcopy/cm/mcp"
-    )
+    servers = {
+        "Bhavcopy MCP": (
+            "https://mcp.nseindia.in/"
+            "bhavcopy/cm/mcp"
+        ),
+        "CM Market MCP": (
+            "https://mcp.nseindia.in/"
+            "cmmkt/mcp"
+        )
+    }
 
-    test_mcp(
-        "CM Market MCP",
-        "https://mcp.nseindia.in/cmmkt/mcp"
-    )
+    for name, url in servers.items():
+
+        mcp_connect(name, url)
 
     progress.progress(55)
 
-    status.write("Loading instrument master...")
+    status.write("Loading F&O instruments...")
 
-    equities, options = load_master()
+    equities = load_master()
 
-    selected_key = next(
+    selected = next(
         (
-            key for key, name in equities.items()
-            if name == symbol
+            key for key, item in equities.items()
+            if item["symbol"] == symbol
         ),
         None
     )
@@ -1412,56 +1977,45 @@ if st.button(
             "Accept": "application/json"
         }
 
-        status.write("Testing Upstox live quotes...")
+        status.write("Testing market quotes...")
 
-        quote_batch(
+        get_quotes(
             ["NSE_INDEX|Nifty 50"],
             auth,
             "NIFTY Quote"
         )
 
-        selected_quote = {}
+        if selected:
 
-        if selected_key:
-
-            selected_quote = quote_batch(
-                [selected_key],
+            quote = get_quotes(
+                [selected],
                 auth,
                 "Selected Stock Quote"
-            ).get(selected_key, {})
+            ).get(selected)
 
-            compare_prices(
+            cross_verify(
                 nse_price,
-                nse_stamp,
-                selected_quote
+                nse_time,
+                quote
             )
 
-            test_option_chain(
-                selected_key,
+            option_chain(
+                selected,
                 auth
-            )
-
-        else:
-
-            add_result(
-                "UPSTOX",
-                "Selected Stock",
-                "NOT FOUND",
-                note=symbol
             )
 
         if full_quotes:
 
             keys = list(equities)
             received = {}
+            started = time.perf_counter()
 
-            before = len(quote_records)
-            scan_start = time.perf_counter()
+            before = len(quote_rows)
 
             for i in range(0, len(keys), 40):
 
                 received.update(
-                    quote_batch(
+                    get_quotes(
                         keys[i:i + 40],
                         auth,
                         f"Quote Batch {i // 40 + 1}"
@@ -1470,117 +2024,154 @@ if st.button(
 
                 time.sleep(0.3)
 
-            sample = quote_records[before:]
+            sample = quote_rows[before:]
 
             fresh = sum(
                 x["Within 5 Seconds"]
                 for x in sample
             )
 
-            coverage = (
-                len(received) / len(keys) * 100
-                if keys else 0
-            )
-
-            add_result(
+            add(
                 "UPSTOX",
-                "Full F&O Quote Coverage",
+                "Full F&O Coverage",
                 "COMPLETE"
                 if keys and len(received) == len(keys)
                 else "PARTIAL",
                 ms=round(
-                    (time.perf_counter() - scan_start)
-                    * 1000
+                    (
+                        time.perf_counter()
+                        - started
+                    ) * 1000
                 ),
-                count=len(received),
+                records=len(received),
                 note=(
                     f"{len(received)}/{len(keys)} | "
-                    f"Coverage {coverage:.2f}% | "
-                    f"Last trade within 5 sec: {fresh}"
+                    f"Fresh within 5s {fresh}"
                 )
             )
 
-        progress.progress(75)
+        progress.progress(70)
 
-        status.write("Testing Upstox News API...")
+        status.write("Testing stock news...")
 
-        if full_news:
-            news_keys = list(equities)
-        else:
-            news_keys = (
-                [selected_key]
-                if selected_key else []
+        keys = (
+            list(equities)
+            if full_news
+            else ([selected] if selected else [])
+        )
+
+        if keys:
+
+            news_test(
+                equities,
+                keys,
+                auth
             )
 
-        if news_keys:
+        progress.progress(85)
 
-            test_news(
-                equities,
-                news_keys,
+        if enable_ws:
+
+            status.write(
+                "Testing live WebSocket..."
+            )
+
+            keys = (
+                list(equities)
+                if full_quotes
+                else ([selected] if selected else [])
+            )
+
+            keys = list(dict.fromkeys(
+                ["NSE_INDEX|Nifty 50"] + keys
+            ))
+
+            websocket_test(
+                keys,
                 auth
             )
 
     else:
 
-        add_result(
+        add(
             "UPSTOX",
-            "Authenticated APIs",
+            "Authenticated Tests",
             "SKIPPED",
             note="Access token required"
         )
 
-    news_df = pd.DataFrame(news_records)
+    ndf = pd.DataFrame(news_rows)
 
-    if not news_df.empty:
+    if not ndf.empty:
 
-        news_df = news_df.drop_duplicates(
+        ndf["Article ID"] = ndf.apply(
+            lambda x: (
+                str(x["URL"]).split("?")[0]
+                if str(x["URL"]).startswith("https://")
+                else normalize(x["Heading"])
+                + "|" + str(x["Published IST"])
+            ),
+            axis=1
+        )
+
+        ndf = ndf.drop_duplicates(
             subset=[
                 "Instrument",
-                "Heading",
-                "Published IST"
+                "Article ID"
             ]
         )
 
-    st.session_state["v2_results"] = (
+        ndf = ndf.sort_values(
+            "Age Seconds",
+            ascending=True
+        )
+
+    st.session_state["v3_results"] = (
         pd.DataFrame(results)
     )
 
-    st.session_state["v2_payloads"] = payloads
+    st.session_state["v3_news"] = ndf
 
-    st.session_state["v2_news"] = news_df
-
-    st.session_state["v2_quotes"] = (
-        pd.DataFrame(quote_records)
+    st.session_state["v3_quotes"] = (
+        pd.DataFrame(quote_rows)
     )
 
-    st.session_state["v2_reports"] = report_frames
+    st.session_state["v3_ws"] = (
+        pd.DataFrame(ws_rows)
+    )
+
+    st.session_state["v3_payloads"] = payloads
+
+    st.session_state["v3_reports"] = reports
 
     progress.progress(100)
 
     status.success(
-        "V2 Data Connectivity Test Completed"
+        "V3 Data Connectivity Test Completed"
     )
 
-if "v2_results" in st.session_state:
+if "v3_results" in st.session_state:
 
-    df = st.session_state["v2_results"]
+    df = st.session_state["v3_results"]
 
     st.divider()
-    st.header("DATA HEALTH REPORT")
+
+    st.header("V3 DATA HEALTH REPORT")
 
     a, b, c = st.columns(3)
 
     a.metric("Total Tests", len(df))
 
     b.metric(
-        "Data / Report Responses",
+        "Data Responses",
         int(
             df["Status"].isin([
                 "DATA RECEIVED",
                 "REPORT RECEIVED",
                 "TOOLS DISCOVERED",
                 "COMPLETE",
-                "COMPLETE REQUESTS"
+                "COMPLETE REQUESTS",
+                "LIVE MESSAGES RECEIVED"
             ]).sum()
         )
     )
@@ -1596,84 +2187,123 @@ if "v2_results" in st.session_state:
     )
 
     st.download_button(
-        "DOWNLOAD V2 TEST REPORT",
+        "DOWNLOAD V3 TEST REPORT",
         df.to_csv(index=False),
-        "data_connectivity_v2.csv",
+        "data_connectivity_v3.csv",
         "text/csv"
     )
 
-    st.subheader("HTTP ERROR DIAGNOSTICS")
+    st.header("HTTP ERROR DIAGNOSTICS")
 
     errors = df[
         df["HTTP"].astype(str).isin([
-            "400", "401", "403",
-            "404", "429", "500",
+            "301", "302", "400", "401",
+            "403", "404", "429", "500",
             "502", "503", "504"
         ])
     ]
 
-    if errors.empty:
-        st.success("No listed HTTP errors")
-    else:
-        st.dataframe(
-            errors,
-            use_container_width=True
-        )
+    st.dataframe(
+        errors,
+        use_container_width=True
+    )
 
-    st.header("NSE CORPORATE ANNOUNCEMENTS")
+    st.header("NSE ANNOUNCEMENTS")
 
     announcements = st.session_state[
-        "v2_payloads"
-    ].get("Corporate Announcements", [])
+        "v3_payloads"
+    ].get(
+        "Corporate Announcements", []
+    )
 
     if announcements:
 
+        adf = pd.DataFrame(
+            announcements
+        )
+
         st.dataframe(
-            pd.DataFrame(announcements),
+            adf,
             use_container_width=True
         )
 
         st.download_button(
-            "DOWNLOAD NSE ANNOUNCEMENT SAMPLE",
-            pd.DataFrame(
-                announcements
-            ).to_csv(index=False),
-            "nse_announcement_sample.csv",
+            "DOWNLOAD NSE ANNOUNCEMENTS",
+            adf.to_csv(index=False),
+            "nse_announcements_v3.csv",
             "text/csv"
         )
 
     else:
-        st.warning("Announcements unavailable")
 
-    st.header("UPSTOX STOCK NEWS")
-
-    news_df = st.session_state["v2_news"]
-
-    if not news_df.empty:
-
-        st.metric(
-            "Unique Stock-News Records",
-            len(news_df)
+        st.warning(
+            "NSE announcements unavailable"
         )
 
+    st.header("COMPANY NEWS INTELLIGENCE")
+
+    ndf = st.session_state["v3_news"]
+
+    if not ndf.empty:
+
+        a, b, c = st.columns(3)
+
+        a.metric("Stock News", len(ndf))
+
+        b.metric(
+            "Unique Articles",
+            ndf["Article ID"].nunique()
+        )
+
+        c.metric(
+            "Stocks With News",
+            ndf["Symbol"].nunique()
+        )
+
+        view = st.radio(
+            "News Filter",
+            [
+                "All News",
+                "Title Match",
+                "Body Match",
+                "Unconfirmed Mapping"
+            ],
+            horizontal=True
+        )
+
+        filtered = ndf.copy()
+
+        if view != "All News":
+
+            filtered = filtered[
+                filtered["Company Relevance"]
+                == view.upper()
+            ]
+
         st.dataframe(
-            news_df,
+            filtered,
             use_container_width=True
         )
 
         st.download_button(
-            "DOWNLOAD STOCK NEWS",
-            news_df.to_csv(index=False),
-            "upstox_stock_news.csv",
+            "DOWNLOAD V3 NEWS INTELLIGENCE",
+            ndf.to_csv(index=False),
+            "news_intelligence_v3.csv",
             "text/csv"
         )
 
+        st.warning(
+            "Company name matching is heuristic. "
+            "It does not establish directional impact."
+        )
+
     else:
+
         st.info("No validated news records")
 
     st.header("QUOTE FRESHNESS")
 
-    qdf = st.session_state["v2_quotes"]
+    qdf = st.session_state["v3_quotes"]
 
     if not qdf.empty:
 
@@ -1683,16 +2313,64 @@ if "v2_results" in st.session_state:
         )
 
         st.download_button(
-            "DOWNLOAD QUOTE FRESHNESS",
+            "DOWNLOAD V3 QUOTE FRESHNESS",
             qdf.to_csv(index=False),
-            "quote_freshness_v2.csv",
+            "quote_freshness_v3.csv",
             "text/csv"
         )
 
-    st.header("NSE OFFICIAL REPORTS")
+    st.header("LIVE WEBSOCKET QUALITY")
+
+    wdf = st.session_state["v3_ws"]
+
+    if not wdf.empty:
+
+        a, b = st.columns(2)
+
+        a.metric(
+            "Instruments Received",
+            wdf["Instrument"].nunique()
+        )
+
+        b.metric(
+            "Instrument Update Records",
+            len(wdf)
+        )
+
+        ages = pd.to_numeric(
+            wdf["Feed Age Seconds"],
+            errors="coerce"
+        ).dropna()
+
+        if not ages.empty:
+
+            st.metric(
+                "Median Feed Timestamp Age",
+                f"{ages.median():.3f} sec"
+            )
+
+        st.dataframe(
+            wdf.tail(200),
+            use_container_width=True
+        )
+
+        st.download_button(
+            "DOWNLOAD WEBSOCKET SAMPLE",
+            wdf.to_csv(index=False),
+            "websocket_sample_v3.csv",
+            "text/csv"
+        )
+
+    else:
+
+        st.info(
+            "No decoded WebSocket data available"
+        )
+
+    st.header("OFFICIAL NSE REPORTS")
 
     for name, frame in st.session_state[
-        "v2_reports"
+        "v3_reports"
     ].items():
 
         with st.expander(name):
@@ -1712,26 +2390,42 @@ if "v2_results" in st.session_state:
                 key="report_" + name
             )
 
-    st.header("NSE MCP AND RESPONSE INSPECTION")
+    st.header("MCP TOOL DISCOVERY")
 
     for name, data in st.session_state[
-        "v2_payloads"
+        "v3_payloads"
     ].items():
 
+        if not name.endswith(" Tools"):
+            continue
+
         with st.expander(name):
+
             st.json(data)
 
+            st.download_button(
+                "DOWNLOAD TOOL SCHEMAS",
+                json.dumps(
+                    data,
+                    indent=2,
+                    default=str
+                ),
+                name.replace(" ", "_") + ".json",
+                "application/json",
+                key="mcp_" + name
+            )
+
     st.warning(
-        "Successful requests do not prove full "
-        "coverage or trading accuracy. Archive "
-        "paths are test candidates. Last trade "
-        "age is not network latency. MCP discovery "
-        "does not establish live market access."
+        "Feed timestamp age is not pure network "
+        "latency. Market closure and clock differences "
+        "can affect freshness. Bulk/block archive "
+        "paths remain candidates. MCP queries require "
+        "inspection of discovered tool schemas."
     )
 
 st.divider()
 
 st.caption(
-    "DATA CONNECTIVITY V2 | "
-    "READ ONLY | NO ORDERS"
+    "DATA CONNECTIVITY V3 | READ ONLY | "
+    "NO AUTOMATIC ORDERS"
 )
