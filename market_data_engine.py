@@ -1,11 +1,12 @@
 # market_data_engine.py
-# NSE F&O PRO V8
+# NSE F&O PRO V8.1
 # NSE MCP + UPSTOX DATA VALIDATION ENGINE
 # Research only - No automatic orders
 
 import json
 import math
 import gzip
+import re
 import requests
 import pandas as pd
 import streamlit as st
@@ -13,15 +14,10 @@ import streamlit as st
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-
 IST = ZoneInfo("Asia/Kolkata")
 
 NSE_CM_URL = "https://mcp.nseindia.in/cmmkt/mcp"
-
-NSE_BHAVCOPY_URL = (
-    "https://mcp.nseindia.in/bhavcopy/cm/mcp"
-)
-
+NSE_BHAVCOPY_URL = "https://mcp.nseindia.in/bhavcopy/cm/mcp"
 UPSTOX_URL = "https://api.upstox.com"
 
 MASTER_URL = (
@@ -41,35 +37,68 @@ def now_ist():
 def number(value):
     try:
         value = float(value)
-
         if math.isfinite(value):
             return value
-
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         pass
 
     return None
 
 
 def parse_time(value):
-
     try:
+        if value is None or isinstance(value, bool):
+            return None
+
+        if isinstance(value, str):
+            value = value.strip()
+
+            if not value:
+                return None
+
+            if re.fullmatch(
+                r"[+-]?\d+(?:\.\d+)?", value
+            ):
+                value = (
+                    float(value)
+                    if "." in value
+                    else int(value)
+                )
 
         if isinstance(value, (int, float)):
-            unit = "ms" if abs(value) >= 1e11 else "s"
+
+            if not math.isfinite(value):
+                return None
+
+            magnitude = abs(value)
+
+            if magnitude >= 1e17:
+                unit = "ns"
+            elif magnitude >= 1e14:
+                unit = "us"
+            elif magnitude >= 1e11:
+                unit = "ms"
+            else:
+                unit = "s"
 
             ts = pd.to_datetime(
                 value,
                 unit=unit,
-                utc=True
+                utc=True,
+                errors="coerce"
             )
 
         else:
-
             ts = pd.Timestamp(value)
+
+            if pd.isna(ts):
+                return None
 
             if ts.tzinfo is None:
                 ts = ts.tz_localize(IST)
+
+        if pd.isna(ts):
+            return None
 
         return ts.tz_convert(IST)
 
@@ -77,26 +106,99 @@ def parse_time(value):
         return None
 
 
-def data_age(value):
+def data_age(value, reference=None):
 
     ts = parse_time(value)
 
     if ts is None:
         return None
 
+    reference = reference or now_ist()
+
+    return float(
+        (reference - ts).total_seconds()
+    )
+
+
+def is_fresh(
+    value,
+    max_seconds=180,
+    reference=None
+):
+
+    reference = reference or now_ist()
+
+    ts = parse_time(value)
+
+    if ts is None:
+        return False
+
+    age = data_age(value, reference)
+
     return (
-        now_ist() - ts
-    ).total_seconds()
-
-
-def is_fresh(value, max_seconds=180):
-
-    age = data_age(value)
-
-    return (
-        age is not None
+        ts.date() == reference.date()
+        and age is not None
         and -5 <= age <= max_seconds
     )
+
+
+def format_time(value):
+
+    ts = parse_time(value)
+
+    if ts is None:
+        return None
+
+    return ts.isoformat()
+
+
+def timestamp_self_test():
+
+    expected = pd.Timestamp(
+        "2026-11-25 14:51:04.449",
+        tz=IST
+    )
+
+    cases = [
+        1795598464449,
+        "1795598464449",
+        "1795598464.449",
+        "2026-11-25T09:21:04.449Z",
+        "2026-11-25 14:51:04.449"
+    ]
+
+    results = []
+
+    for value in cases:
+
+        parsed = parse_time(value)
+
+        passed = (
+            parsed is not None
+            and abs(
+                (parsed - expected).total_seconds()
+            ) < 0.001
+        )
+
+        results.append({
+            "Input": str(value),
+            "Converted IST": format_time(value),
+            "Status": "PASS" if passed else "FAIL"
+        })
+
+    for value in [None, "", "invalid"]:
+
+        results.append({
+            "Input": str(value),
+            "Converted IST": format_time(value),
+            "Status": (
+                "PASS"
+                if parse_time(value) is None
+                else "FAIL"
+            )
+        })
+
+    return pd.DataFrame(results)
 
 
 # ==========================================
@@ -120,13 +222,15 @@ class NSEMCPClient:
 
         self.initialized = False
 
-
     def close(self):
         self.session.close()
 
-
-    def request(self, method, params=None,
-                notification=False):
+    def request(
+        self,
+        method,
+        params=None,
+        notification=False
+    ):
 
         self.request_id += 1
 
@@ -176,6 +280,7 @@ class NSEMCPClient:
             ).splitlines():
 
                 if line.startswith("data:"):
+
                     event_data.append(
                         line[5:].strip()
                     )
@@ -213,7 +318,6 @@ class NSEMCPClient:
 
         return result.get("result", {})
 
-
     def initialize(self):
 
         if self.initialized:
@@ -226,7 +330,7 @@ class NSEMCPClient:
                 "capabilities": {},
                 "clientInfo": {
                     "name": "NSE-FO-PRO-V8",
-                    "version": "8.0"
+                    "version": "8.1"
                 }
             }
         )
@@ -246,7 +350,6 @@ class NSEMCPClient:
         )
 
         self.initialized = True
-
 
     def list_tools(self):
 
@@ -274,7 +377,6 @@ class NSEMCPClient:
             params = {"cursor": cursor}
 
         return tools
-
 
     def call(self, name, arguments=None):
 
@@ -347,12 +449,10 @@ class NSEMarketData:
             NSE_BHAVCOPY_URL
         )
 
-
     def close(self):
 
         self.cm.close()
         self.bhavcopy.close()
-
 
     def connectivity(self):
 
@@ -381,13 +481,11 @@ class NSEMarketData:
 
         return result
 
-
     def market_status(self):
 
         return self.cm.call(
             "cm_get_data_status", {}
         )
-
 
     def equity_status(self):
 
@@ -395,19 +493,18 @@ class NSEMarketData:
             "cm_get_allstocks_status", {}
         )
 
-
     def stock_quote(self, symbol):
 
         return self.cm.call(
             "cm_get_stock_quote",
-            {
-                "symbol": symbol.upper()
-            }
+            {"symbol": symbol.upper()}
         )
 
-
-    def equity_stocks(self, prefix="",
-                      limit=500):
+    def equity_stocks(
+        self,
+        prefix="",
+        limit=500
+    ):
 
         return self.cm.call(
             "cm_get_equity_stocks",
@@ -419,16 +516,12 @@ class NSEMarketData:
             }
         )
 
-
     def index_quote(self, name):
 
         return self.cm.call(
             "cm_get_index_quote",
-            {
-                "indexName": name
-            }
+            {"indexName": name}
         )
-
 
     def live_indices(self, group="all"):
 
@@ -440,20 +533,13 @@ class NSEMarketData:
             }
         )
 
-
     def sector_strength(self):
 
-        return self.live_indices(
-            "sectoral"
-        )
-
+        return self.live_indices("sectoral")
 
     def india_vix(self):
 
-        return self.index_quote(
-            "INDIA VIX"
-        )
-
+        return self.index_quote("INDIA VIX")
 
     def market_movers(self, limit=50):
 
@@ -467,29 +553,25 @@ class NSEMarketData:
             }
         )
 
-
     def market_breadth(self, date):
 
         return self.bhavcopy.call(
             "get_market_breadth",
-            {
-                "date": str(date)
-            }
+            {"date": str(date)}
         )
-
 
     def market_mood(self, date):
 
         return self.bhavcopy.call(
             "get_market_mood",
-            {
-                "date": str(date)
-            }
+            {"date": str(date)}
         )
 
-
-    def historical_movers(self, date,
-                          direction="gain"):
+    def historical_movers(
+        self,
+        date,
+        direction="gain"
+    ):
 
         return self.bhavcopy.call(
             "get_top_movers",
@@ -499,7 +581,6 @@ class NSEMarketData:
                 "direction": direction
             }
         )
-
 
     def historical_turnover(self, date):
 
@@ -511,7 +592,6 @@ class NSEMarketData:
                 "sortBy": "value"
             }
         )
-
 
     def corporate_actions(
         self, symbol, start, end
@@ -526,9 +606,10 @@ class NSEMarketData:
             }
         )
 
-
     def stock_history(
-        self, symbol, months=3,
+        self,
+        symbol,
+        months=3,
         end_date=None
     ):
 
@@ -548,9 +629,7 @@ class NSEMarketData:
         ).date()
 
         actions = self.corporate_actions(
-            symbol,
-            start,
-            end
+            symbol, start, end
         )
 
         history = self.bhavcopy.call(
@@ -573,9 +652,10 @@ class NSEMarketData:
             )
         }
 
-
     def volume_analysis(
-        self, symbol, days=30
+        self,
+        symbol,
+        days=30
     ):
 
         return self.bhavcopy.call(
@@ -734,8 +814,13 @@ def upstox_market_status(token):
 
 def validate_nse_stock(
     stock,
-    max_age=180
+    max_age=180,
+    reference=None
 ):
+
+    reference = reference or now_ist()
+
+    stock = stock or {}
 
     errors = []
     warnings = []
@@ -806,7 +891,30 @@ def validate_nse_stock(
 
         errors.append("INVALID VOLUME")
 
-    if not is_fresh(timestamp, max_age):
+    nse_time = parse_time(timestamp)
+
+    age = data_age(
+        timestamp,
+        reference
+    )
+
+    if nse_time is None:
+
+        errors.append(
+            "INVALID NSE TIMESTAMP"
+        )
+
+    elif age < -5:
+
+        errors.append(
+            "NSE TIMESTAMP IN FUTURE"
+        )
+
+    elif not is_fresh(
+        timestamp,
+        max_age,
+        reference
+    ):
 
         errors.append("STALE NSE DATA")
 
@@ -890,8 +998,14 @@ def validate_nse_stock(
 
         "NSE Timestamp": timestamp,
 
-        "NSE Age Seconds": data_age(
+        "NSE Timestamp IST": format_time(
             timestamp
+        ),
+
+        "NSE Age Seconds": (
+            round(age, 3)
+            if age is not None
+            else None
         ),
 
         "NSE Valid": not errors,
@@ -911,12 +1025,16 @@ def cross_verify(
     upstox_stock,
     tolerance_pct=0.35,
     max_age=180,
-    max_time_gap=90
+    max_time_gap=90,
+    reference=None
 ):
+
+    reference = reference or now_ist()
 
     result = validate_nse_stock(
         nse_stock,
-        max_age
+        max_age,
+        reference
     )
 
     upstox_stock = upstox_stock or {}
@@ -927,12 +1045,26 @@ def cross_verify(
 
     nse_ltp = result["NSE LTP"]
 
-    timestamp = (
-
-        upstox_stock.get("last_trade_time")
-
-        or upstox_stock.get("timestamp")
+    trade_timestamp = upstox_stock.get(
+        "last_trade_time"
     )
+
+    quote_timestamp = upstox_stock.get(
+        "timestamp"
+    )
+
+    timestamp = trade_timestamp
+
+    timestamp_source = "last_trade_time"
+
+    if (
+        trade_timestamp is None
+        or trade_timestamp == ""
+    ):
+
+        timestamp = quote_timestamp
+
+        timestamp_source = "timestamp"
 
     reasons = []
 
@@ -948,12 +1080,6 @@ def cross_verify(
             "UPSTOX PRICE UNAVAILABLE"
         )
 
-    if not is_fresh(timestamp, max_age):
-
-        reasons.append(
-            "STALE UPSTOX DATA"
-        )
-
     nse_time = parse_time(
         result["NSE Timestamp"]
     )
@@ -961,6 +1087,42 @@ def cross_verify(
     upstox_time = parse_time(
         timestamp
     )
+
+    upstox_age = data_age(
+        timestamp,
+        reference
+    )
+
+    if upstox_time is None:
+
+        reasons.append(
+            "INVALID UPSTOX TIMESTAMP"
+        )
+
+    elif upstox_age < -5:
+
+        reasons.append(
+            "UPSTOX TIMESTAMP IN FUTURE"
+        )
+
+    elif not is_fresh(
+        timestamp,
+        max_age,
+        reference
+    ):
+
+        reasons.append(
+            "STALE UPSTOX DATA"
+        )
+
+    # Quote timestamp alone does not prove
+    # that the last traded price is fresh.
+
+    if timestamp_source != "last_trade_time":
+
+        reasons.append(
+            "LAST TRADE TIME UNAVAILABLE"
+        )
 
     time_gap = None
 
@@ -1010,19 +1172,60 @@ def cross_verify(
                 "SOURCE PRICE MISMATCH"
             )
 
+    else:
+
+        reasons.append(
+            "PRICE COMPARISON UNAVAILABLE"
+        )
+
+    reasons = list(
+        dict.fromkeys(reasons)
+    )
+
     result.update({
 
         "Upstox LTP": upstox_ltp,
 
         "Upstox Timestamp": timestamp,
 
-        "Upstox Age Seconds": data_age(
-            timestamp
+        "Upstox Timestamp Source":
+            timestamp_source,
+
+        "Upstox Timestamp IST":
+            format_time(timestamp),
+
+        "Upstox Quote Timestamp IST":
+            format_time(quote_timestamp),
+
+        "Upstox Age Seconds": (
+            round(upstox_age, 3)
+            if upstox_age is not None
+            else None
         ),
 
-        "Source Time Gap Seconds": time_gap,
+        "Source Time Gap Seconds": (
+            round(time_gap, 3)
+            if time_gap is not None
+            else None
+        ),
 
-        "Price Difference %": difference,
+        "Price Difference %": (
+            round(difference, 6)
+            if difference is not None
+            else None
+        ),
+
+        "Maximum Allowed Age Seconds":
+            max_age,
+
+        "Maximum Allowed Gap Seconds":
+            max_time_gap,
+
+        "Maximum Allowed Price Difference %":
+            tolerance_pct,
+
+        "Verification Time IST":
+            reference.isoformat(),
 
         "Cross Verified": not reasons,
 
@@ -1051,7 +1254,8 @@ def scan_fo_market(
     token,
     symbols=None,
     tolerance_pct=0.35,
-    max_age=180
+    max_age=180,
+    max_time_gap=90
 ):
 
     universe = get_fo_universe()
@@ -1086,12 +1290,15 @@ def scan_fo_market(
 
     try:
 
+        # Smaller batches reduce the time
+        # gap between NSE and Upstox quotes.
+
         for start in range(
-            0, len(selected), 20
+            0, len(selected), 10
         ):
 
             batch = selected[
-                start:start + 20
+                start:start + 10
             ]
 
             nse_records = {}
@@ -1151,6 +1358,8 @@ def scan_fo_market(
 
                 quote_error = str(e)
 
+            reference = now_ist()
+
             for symbol, stock in (
                 nse_records.items()
             ):
@@ -1165,7 +1374,11 @@ def scan_fo_market(
 
                     tolerance_pct,
 
-                    max_age
+                    max_age,
+
+                    max_time_gap,
+
+                    reference
                 )
 
                 if quote_error:
@@ -1173,6 +1386,12 @@ def scan_fo_market(
                     result[
                         "Verification Reasons"
                     ] += " | " + quote_error
+
+                    result["Cross Verified"] = False
+
+                    result[
+                        "Verification Status"
+                    ] = "BLOCKED"
 
                 result["Instrument Key"] = (
                     universe[symbol]
@@ -1218,9 +1437,23 @@ def scan_fo_market(
 
         "Blocked": len(frame) - verified,
 
+        "Attempted Coverage %": round(
+
+            100 * len(frame) / len(universe),
+
+            2
+        ),
+
         "Verified Coverage %": round(
 
             100 * verified / len(universe),
+
+            2
+        ),
+
+        "Selected Verification Rate %": round(
+
+            100 * verified / len(selected),
 
             2
         ),
@@ -1246,6 +1479,48 @@ def rank_verified_stocks(frame):
         frame["Cross Verified"] == True
 
     ].copy()
+
+    if data.empty:
+        return data
+
+    reference = now_ist()
+
+    # Previously verified records must
+    # still be fresh when ranked.
+
+    fresh_mask = data.apply(
+
+        lambda row: (
+
+            is_fresh(
+
+                row.get("NSE Timestamp"),
+
+                row.get(
+                    "Maximum Allowed Age Seconds",
+                    180
+                ),
+
+                reference
+            )
+
+            and is_fresh(
+
+                row.get("Upstox Timestamp"),
+
+                row.get(
+                    "Maximum Allowed Age Seconds",
+                    180
+                ),
+
+                reference
+            )
+        ),
+
+        axis=1
+    )
+
+    data = data[fresh_mask].copy()
 
     if data.empty:
         return data
@@ -1341,13 +1616,32 @@ def rank_verified_stocks(frame):
 def render_market_data_engine():
 
     st.title(
-        "NSE F&O PRO V8 — DATA ENGINE"
+        "NSE F&O PRO V8.1 — DATA ENGINE"
     )
 
     st.caption(
         "NSE MCP + Upstox | "
+        "Timestamp Fixed | "
         "Data Quality | Cross Verification"
     )
+
+    if st.session_state.get(
+        "v8_engine_version"
+    ) != "8.1":
+
+        for key in [
+            "v8_single",
+            "v8_scan",
+            "v8_coverage"
+        ]:
+
+            st.session_state.pop(
+                key, None
+            )
+
+        st.session_state[
+            "v8_engine_version"
+        ] = "8.1"
 
     token = st.sidebar.text_input(
 
@@ -1382,6 +1676,19 @@ def render_market_data_engine():
         step=30
     )
 
+    max_time_gap = st.sidebar.slider(
+
+        "Maximum Source Time Gap Seconds",
+
+        min_value=30,
+
+        max_value=180,
+
+        value=90,
+
+        step=15
+    )
+
     test_date = st.sidebar.date_input(
 
         "Historical Test Date",
@@ -1392,6 +1699,44 @@ def render_market_data_engine():
 
         max_value=now_ist().date()
     )
+
+    st.caption(
+        "Server Time IST: "
+        + now_ist().strftime(
+            "%d-%m-%Y %H:%M:%S"
+        )
+    )
+
+    if st.button(
+        "TEST TIMESTAMP CONVERSION"
+    ):
+
+        st.session_state[
+            "v81_timestamp_test"
+        ] = timestamp_self_test()
+
+    if "v81_timestamp_test" in st.session_state:
+
+        tests = st.session_state[
+            "v81_timestamp_test"
+        ]
+
+        if tests["Status"].eq("PASS").all():
+
+            st.success(
+                "ALL TIMESTAMP TESTS PASSED"
+            )
+
+        else:
+
+            st.error(
+                "TIMESTAMP TEST FAILED"
+            )
+
+        st.dataframe(
+            tests,
+            use_container_width=True
+        )
 
     client = NSEMarketData()
 
@@ -1591,6 +1936,10 @@ def render_market_data_engine():
                 "TEST SINGLE STOCK"
             ):
 
+                st.session_state.pop(
+                    "v8_single", None
+                )
+
                 if not token:
 
                     st.error(
@@ -1604,6 +1953,14 @@ def render_market_data_engine():
                         stock = client.stock_quote(
                             symbol
                         ).get("stock", {})
+
+                        if stock.get(
+                            "symbol"
+                        ) != symbol:
+
+                            raise RuntimeError(
+                                "NSE symbol mismatch"
+                            )
 
                         quotes = upstox_quotes(
 
@@ -1622,7 +1979,9 @@ def render_market_data_engine():
 
                             tolerance,
 
-                            max_age
+                            max_age,
+
+                            max_time_gap
                         )
 
                         st.session_state[
@@ -1639,16 +1998,84 @@ def render_market_data_engine():
                     "v8_single"
                 ]
 
-                if result["Cross Verified"]:
+                st.caption(
+                    "Saved test result: "
+                    + str(result.get("Symbol"))
+                    + " | "
+                    + str(
+                        result.get(
+                            "Verification Time IST"
+                        )
+                    )
+                )
 
-                    st.success(
-                        "NSE + UPSTOX VERIFIED"
+                still_fresh = (
+
+                    is_fresh(
+
+                        result.get(
+                            "NSE Timestamp"
+                        ),
+
+                        max_age
+                    )
+
+                    and is_fresh(
+
+                        result.get(
+                            "Upstox Timestamp"
+                        ),
+
+                        max_age
+                    )
+                )
+
+                same_settings = (
+
+                    result.get(
+                        "Maximum Allowed Age Seconds"
+                    ) == max_age
+
+                    and result.get(
+                        "Maximum Allowed Gap Seconds"
+                    ) == max_time_gap
+
+                    and result.get(
+                        "Maximum Allowed Price Difference %"
+                    ) == tolerance
+                )
+
+                if result["Symbol"] != symbol:
+
+                    st.warning(
+                        "Saved result belongs to "
+                        "another stock. Test again."
+                    )
+
+                elif not same_settings:
+
+                    st.warning(
+                        "Settings changed. "
+                        "Test again."
+                    )
+
+                elif not result["Cross Verified"]:
+
+                    st.warning(
+                        "DATA VERIFICATION BLOCKED"
+                    )
+
+                elif not still_fresh:
+
+                    st.warning(
+                        "PREVIOUSLY VERIFIED — "
+                        "DATA NOW STALE"
                     )
 
                 else:
 
-                    st.warning(
-                        "DATA VERIFICATION BLOCKED"
+                    st.success(
+                        "NSE + UPSTOX VERIFIED"
                     )
 
                 st.json(result)
@@ -1670,6 +2097,14 @@ def render_market_data_engine():
                 "RUN F&O DATA SCANNER",
                 type="primary"
             ):
+
+                st.session_state.pop(
+                    "v8_scan", None
+                )
+
+                st.session_state.pop(
+                    "v8_coverage", None
+                )
 
                 if not token:
 
@@ -1710,7 +2145,9 @@ def render_market_data_engine():
 
                                     tolerance,
 
-                                    max_age
+                                    max_age,
+
+                                    max_time_gap
                                 )
                             )
 
@@ -1736,6 +2173,12 @@ def render_market_data_engine():
                 "v8_coverage"
             ]
 
+            st.caption(
+                "Saved scan results. "
+                "Verification counts refer to "
+                "the original scan time."
+            )
+
             a, b, c = st.columns(3)
 
             a.metric(
@@ -1744,7 +2187,7 @@ def render_market_data_engine():
             )
 
             b.metric(
-                "Verified",
+                "Verified at Scan",
                 coverage["Verified"]
             )
 
@@ -1766,8 +2209,56 @@ def render_market_data_engine():
                 use_container_width=True
             )
 
+            ranking_frame = frame.copy()
+
+            required_columns = [
+
+                "Maximum Allowed Age Seconds",
+
+                "Maximum Allowed Gap Seconds",
+
+                "Maximum Allowed Price Difference %"
+            ]
+
+            if all(
+                col in ranking_frame.columns
+                for col in required_columns
+            ):
+
+                ranking_frame = ranking_frame[
+
+                    (
+                        ranking_frame[
+                            required_columns[0]
+                        ] == max_age
+                    )
+
+                    & (
+                        ranking_frame[
+                            required_columns[1]
+                        ] == max_time_gap
+                    )
+
+                    & (
+                        ranking_frame[
+                            required_columns[2]
+                        ] == tolerance
+                    )
+                ]
+
+            else:
+
+                ranking_frame = (
+                    ranking_frame.iloc[0:0]
+                )
+
             ranked = rank_verified_stocks(
-                frame
+                ranking_frame
+            )
+
+            st.metric(
+                "Currently Fresh Verified Stocks",
+                len(ranked)
             )
 
             if not ranked.empty:
@@ -1807,7 +2298,8 @@ def render_market_data_engine():
             else:
 
                 st.warning(
-                    "No verified candidates"
+                    "No fresh verified candidates "
+                    "under current settings."
                 )
 
             st.download_button(
@@ -1818,12 +2310,17 @@ def render_market_data_engine():
                     index=False
                 ).encode("utf-8"),
 
-                "v8_market_validation.csv",
+                "v81_market_validation.csv",
 
                 "text/csv"
             )
 
         report = {
+
+            "Engine Version": "8.1",
+
+            "Report Time IST":
+                now_ist().isoformat(),
 
             "Connectivity":
                 st.session_state.get(
@@ -1861,7 +2358,7 @@ def render_market_data_engine():
                 default=str
             ),
 
-            "v8_data_engine_report.json",
+            "v81_data_engine_report.json",
 
             "application/json"
         )
@@ -1876,8 +2373,10 @@ def render_market_data_engine():
 
         "Research only. Verified prices and "
         "momentum rankings are not final "
-        "option entry signals. No automatic "
-        "orders are placed."
+        "option entry signals. "
+        "Verification is a snapshot, not "
+        "continuous monitoring. "
+        "No automatic orders are placed."
     )
 
 
@@ -1889,7 +2388,7 @@ if __name__ == "__main__":
 
     st.set_page_config(
 
-        page_title="NSE F&O PRO V8",
+        page_title="NSE F&O PRO V8.1",
 
         page_icon="📊",
 
