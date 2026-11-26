@@ -1,16 +1,8 @@
 
 """
-NSE Intelligence Engine V8.6.1
-
-Safe Redirect Handling
-NSE Announcements
-NSE Pre Open
-NSE Bulk and Block Deals
-CM and FO Bhavcopy
-Delivery Data
-Short Selling
-Upstox Company News
-
+NSE MARKET INTELLIGENCE ENGINE
+Version 8.6.2
+Secure NSE Domain Redirect Support
 Research Only - No Automatic Orders
 """
 
@@ -29,11 +21,11 @@ from urllib.parse import urlparse, urljoin
 # CONFIGURATION
 # =====================================
 
-VERSION = "8.6.1"
+VERSION = "8.6.2"
 
 IST = ZoneInfo("Asia/Kolkata")
 
-NSE = "https://www.nseindia.com"
+NSE = "https://www.nseindia.in"
 ARC = "https://nsearchives.nseindia.com"
 UP = "https://api.upstox.com"
 
@@ -42,16 +34,26 @@ HEADERS = {
     "Accept": "application/json, text/plain, */*"
 }
 
-ALLOWED_HOSTS = {
+NSE_HOSTS = {
     "www.nseindia.com",
     "nseindia.com",
-    "nsearchives.nseindia.com",
+    "www.nseindia.in",
+    "nseindia.in",
+    "nsearchives.nseindia.com"
+}
+
+UPSTOX_HOSTS = {
     "api.upstox.com"
 }
+
+ALLOWED_HOSTS = NSE_HOSTS | UPSTOX_HOSTS
 
 REDIRECT_CODES = {
     301, 302, 303, 307, 308
 }
+
+MAX_REDIRECTS = 5
+MAX_REPORT_SIZE = 100_000_000
 
 
 # =====================================
@@ -62,98 +64,147 @@ def now():
     return datetime.now(IST)
 
 
-def result(source, rows=None, error=""):
+def result(
+    source,
+    rows=None,
+    error="",
+    diagnostics=None
+):
 
     rows = rows if rows is not None else []
 
     return {
         "source": source,
         "available": not bool(error),
-        "records": len(rows),
+        "records": len(rows) if not error else None,
         "items": rows,
         "error": error,
-        "checked": now().isoformat()
+        "checked": now().isoformat(),
+        "diagnostics": diagnostics or {}
     }
 
 
 # =====================================
-# SAFE HTTP REQUEST ENGINE
+# SECURE HTTP ENGINE
 # =====================================
 
-def safe_request(
+def validate_url(url, allowed_hosts):
+
+    parsed = urlparse(url)
+
+    if parsed.scheme != "https":
+        raise RuntimeError(
+            "Only HTTPS connections permitted"
+        )
+
+    if parsed.hostname not in allowed_hosts:
+        raise RuntimeError(
+            "Unsafe redirect destination | Host: "
+            + str(parsed.hostname)
+        )
+
+    if parsed.username or parsed.password:
+        raise RuntimeError(
+            "URL credentials not permitted"
+        )
+
+    if parsed.port not in (None, 443):
+        raise RuntimeError(
+            "Unsafe destination port"
+        )
+
+    return parsed
+
+
+def secure_get(
     url,
     params=None,
     headers=None,
-    timeout=(5, 15)
+    timeout=(5, 20),
+    diagnostics=None
 ):
+
+    diagnostics = (
+        diagnostics
+        if diagnostics is not None
+        else {}
+    )
+
+    parsed = urlparse(url)
+
+    if parsed.hostname in NSE_HOSTS:
+        allowed = NSE_HOSTS
+
+    elif parsed.hostname in UPSTOX_HOSTS:
+        allowed = UPSTOX_HOSTS
+
+    else:
+        raise RuntimeError(
+            "Unknown source host"
+        )
+
+    validate_url(url, allowed)
 
     request_headers = dict(
         headers or HEADERS
     )
 
-    current_url = url
-
-    initial = urlparse(url)
-
-    redirects = []
-
-    authenticated = any(
-        str(k).lower() == "authorization"
+    has_token = any(
+        k.lower() == "authorization"
         for k in request_headers
     )
 
+    if has_token and allowed != UPSTOX_HOSTS:
+        raise RuntimeError(
+            "Authorization header restricted "
+            "to Upstox"
+        )
+
+    diagnostics.update({
+        "Initial URL": url,
+        "Redirects": [],
+        "HTTP Status": None,
+        "Final URL": "",
+        "Final Host": "",
+        "Content Type": ""
+    })
+
+    current_url = url
+    current_params = params
+
     with requests.Session() as session:
 
-        for attempt in range(6):
+        for attempt in range(MAX_REDIRECTS + 1):
 
-            parsed = urlparse(current_url)
-
-            if (
-                parsed.scheme != "https"
-                or parsed.hostname not in ALLOWED_HOSTS
-                or parsed.username
-                or parsed.password
-                or parsed.port not in (None, 443)
-            ):
-
-                raise RuntimeError(
-                    "Unsafe redirect destination | "
-                    f"Host: {parsed.hostname}"
-                )
-
-            if (
-                authenticated
-                and parsed.hostname != initial.hostname
-            ):
-
-                raise RuntimeError(
-                    "Cross-domain token redirect blocked"
-                )
-
-            if (
-                initial.hostname != "api.upstox.com"
-                and parsed.hostname == "api.upstox.com"
-            ):
-
-                raise RuntimeError(
-                    "Unexpected provider redirect"
-                )
-
-            if (
-                initial.hostname == "api.upstox.com"
-                and parsed.hostname != "api.upstox.com"
-            ):
-
-                raise RuntimeError(
-                    "Unexpected Upstox redirect"
-                )
+            validate_url(
+                current_url,
+                allowed
+            )
 
             response = session.get(
                 current_url,
-                params=params if attempt == 0 else None,
+                params=current_params,
                 headers=request_headers,
                 timeout=timeout,
                 allow_redirects=False
+            )
+
+            diagnostics["HTTP Status"] = (
+                response.status_code
+            )
+
+            diagnostics["Final URL"] = (
+                response.url
+            )
+
+            diagnostics["Final Host"] = (
+                urlparse(response.url).hostname
+            )
+
+            diagnostics["Content Type"] = (
+                response.headers.get(
+                    "Content-Type", ""
+                )
             )
 
             if response.status_code in REDIRECT_CODES:
@@ -163,7 +214,6 @@ def safe_request(
                 )
 
                 if not location:
-
                     raise RuntimeError(
                         "Redirect location missing"
                     )
@@ -173,81 +223,76 @@ def safe_request(
                     location
                 )
 
-                next_parsed = urlparse(next_url)
-
-                redirects.append({
+                diagnostics["Redirects"].append({
                     "Status": response.status_code,
-                    "From": parsed.hostname,
-                    "To": next_parsed.hostname,
-                    "Path": next_parsed.path
+                    "From": response.url,
+                    "To": next_url
                 })
 
-                current_url = next_url
+                validate_url(
+                    next_url,
+                    allowed
+                )
 
+                if attempt >= MAX_REDIRECTS:
+                    raise RuntimeError(
+                        "Maximum redirects exceeded"
+                    )
+
+                current_url = next_url
+                current_params = None
+
+                response.close()
                 continue
 
             if response.status_code != 200:
-
                 raise RuntimeError(
-                    f"HTTP {response.status_code} | "
-                    f"Host: {parsed.hostname} | "
-                    f"Path: {parsed.path} | "
-                    f"Redirects: {redirects}"
+                    f"HTTP {response.status_code}"
+                    f" | Host: "
+                    f"{diagnostics['Final Host']}"
                 )
 
-            return response, redirects
+            return response
 
     raise RuntimeError(
-        "Maximum redirect limit exceeded | "
-        f"Redirects: {redirects}"
+        "Request did not complete"
     )
 
-
-# =====================================
-# JSON RESPONSE VALIDATION
-# =====================================
 
 def get_json(
     url,
     params=None,
-    headers=None
+    headers=None,
+    diagnostics=None
 ):
 
-    response, redirects = safe_request(
+    response = secure_get(
         url,
         params=params,
         headers=headers,
-        timeout=(5, 15)
+        timeout=(5, 15),
+        diagnostics=diagnostics
     )
 
-    final = urlparse(response.url)
-
     try:
-
-        data = response.json()
+        return response.json()
 
     except ValueError:
-
         raise RuntimeError(
-            "HTTP 200 but invalid JSON | "
-            f"Host: {final.hostname} | "
-            f"Path: {final.path} | "
-            f"Redirects: {redirects}"
+            "Invalid JSON response"
         )
 
-    if not isinstance(data, (dict, list)):
+    finally:
+        response.close()
 
-        raise ValueError(
-            "Unexpected JSON schema"
-        )
 
-    return data
-
+# =====================================
+# RESPONSE SCHEMA VALIDATION
+# =====================================
 
 def extract_rows(data):
 
     if isinstance(data, list):
-
         rows = data
 
     elif isinstance(data, dict):
@@ -266,26 +311,22 @@ def extract_rows(data):
             if isinstance(data.get(key), list):
 
                 rows = data[key]
-
                 break
 
         if rows is None:
-
             raise ValueError(
                 "Unknown response schema"
             )
 
     else:
-
         raise ValueError(
-            "Invalid response"
+            "Invalid response format"
         )
 
     if not all(
         isinstance(x, dict)
         for x in rows
     ):
-
         raise ValueError(
             "Invalid record schema"
         )
@@ -303,27 +344,30 @@ def extract_rows(data):
 )
 def announcements():
 
+    diagnostics = {}
+
     try:
 
         data = get_json(
             NSE + "/api/corporate-announcements",
-            {
-                "index": "equities"
-            }
+            {"index": "equities"},
+            diagnostics=diagnostics
         )
 
         rows = extract_rows(data)
 
         return result(
             "NSE Announcements",
-            rows
+            rows,
+            diagnostics=diagnostics
         )
 
-    except Exception as exc:
+    except Exception as e:
 
         return result(
             "NSE Announcements",
-            error=str(exc)
+            error=str(e),
+            diagnostics=diagnostics
         )
 
 
@@ -337,25 +381,28 @@ def announcements():
 )
 def pre_open():
 
+    diagnostics = {}
+
     try:
 
         data = get_json(
             NSE + "/api/market-data-pre-open",
-            {
-                "key": "FO"
-            }
+            {"key": "FO"},
+            diagnostics=diagnostics
         )
 
         return result(
             "NSE Pre Open",
-            extract_rows(data)
+            extract_rows(data),
+            diagnostics=diagnostics
         )
 
-    except Exception as exc:
+    except Exception as e:
 
         return result(
             "NSE Pre Open",
-            error=str(exc)
+            error=str(e),
+            diagnostics=diagnostics
         )
 
 
@@ -376,7 +423,6 @@ def deals(
     kind = kind.upper()
 
     if kind not in ("BULK", "BLOCK"):
-
         raise ValueError(
             "Invalid deal type"
         )
@@ -389,6 +435,8 @@ def deals(
 
     source = "NSE " + kind + " Deals"
 
+    diagnostics = {}
+
     try:
 
         data = get_json(
@@ -400,19 +448,22 @@ def deals(
                 "to": end_date.strftime(
                     "%d-%m-%Y"
                 )
-            }
+            },
+            diagnostics=diagnostics
         )
 
         return result(
             source,
-            extract_rows(data)
+            extract_rows(data),
+            diagnostics=diagnostics
         )
 
-    except Exception as exc:
+    except Exception as e:
 
         return result(
             source,
-            error=str(exc)
+            error=str(e),
+            diagnostics=diagnostics
         )
 
 
@@ -420,27 +471,25 @@ def deals(
 # HISTORICAL REPORT DOWNLOADER
 # =====================================
 
-def download_report(url):
+def download_report(
+    url,
+    diagnostics=None
+):
 
-    response = requests.get(
+    response = secure_get(
         url,
-        headers=HEADERS,
-        timeout=(5, 25),
-        allow_redirects=False
+        timeout=(5, 30),
+        diagnostics=diagnostics
     )
 
-    if response.status_code != 200:
+    try:
+        content = response.content
+    finally:
+        response.close()
 
-        raise RuntimeError(
-            f"HTTP {response.status_code}"
-        )
-
-    content = response.content
-
-    if len(content) > 100_000_000:
-
+    if len(content) > MAX_REPORT_SIZE:
         raise ValueError(
-            "Report too large"
+            "Report exceeds size limit"
         )
 
     if content[:2] == b"PK":
@@ -457,31 +506,23 @@ def download_report(url):
             ]
 
             if not files:
-
                 raise ValueError(
                     "CSV not found"
                 )
 
-            if files[0].file_size > 100_000_000:
-
+            if files[0].file_size > MAX_REPORT_SIZE:
                 raise ValueError(
-                    "Report too large"
+                    "Uncompressed report too large"
                 )
 
-            with archive.open(files[0]) as file:
+            with archive.open(files[0]) as f:
 
                 df = pd.read_csv(
-                    file,
+                    f,
                     low_memory=False
                 )
 
     else:
-
-        if content.lstrip().startswith(b"<"):
-
-            raise ValueError(
-                "HTML returned instead of CSV"
-            )
 
         df = pd.read_csv(
             io.BytesIO(content),
@@ -494,6 +535,32 @@ def download_report(url):
     ]
 
     return df
+
+
+def report_result(
+    source,
+    date,
+    frame=None,
+    error="",
+    diagnostics=None
+):
+
+    if frame is None:
+        frame = pd.DataFrame()
+
+    return {
+        "source": source,
+        "available": not bool(error),
+        "records": (
+            len(frame)
+            if not error else None
+        ),
+        "date": str(date),
+        "data": frame,
+        "error": error,
+        "checked": now().isoformat(),
+        "diagnostics": diagnostics or {}
+    }
 
 
 # =====================================
@@ -512,7 +579,6 @@ def bhavcopy(
     segment = segment.upper()
 
     if segment not in ("CM", "FO"):
-
         raise ValueError(
             "Invalid segment"
         )
@@ -530,9 +596,14 @@ def bhavcopy(
         "NSE " + segment + " Bhavcopy"
     )
 
+    diagnostics = {}
+
     try:
 
-        df = download_report(url)
+        df = download_report(
+            url,
+            diagnostics
+        )
 
         required = {
             "TCKRSYMB",
@@ -541,15 +612,15 @@ def bhavcopy(
         }
 
         if segment == "FO":
-
             required.add(
                 "OPNINTRST"
             )
 
-        if not required.issubset(df.columns):
-
+        if not required.issubset(
+            df.columns
+        ):
             raise ValueError(
-                "Schema mismatch"
+                "Bhavcopy schema mismatch"
             )
 
         dates = pd.to_datetime(
@@ -561,32 +632,25 @@ def bhavcopy(
             df.empty
             or not dates.eq(date).all()
         ):
-
             raise ValueError(
-                "Report date mismatch"
+                "Bhavcopy report date mismatch"
             )
 
-        return {
-            "source": source,
-            "available": True,
-            "records": len(df),
-            "date": str(date),
-            "data": df,
-            "error": "",
-            "checked": now().isoformat()
-        }
+        return report_result(
+            source,
+            date,
+            df,
+            diagnostics=diagnostics
+        )
 
-    except Exception as exc:
+    except Exception as e:
 
-        return {
-            "source": source,
-            "available": False,
-            "records": 0,
-            "date": str(date),
-            "data": pd.DataFrame(),
-            "error": str(exc),
-            "checked": now().isoformat()
-        }
+        return report_result(
+            source,
+            date,
+            error=str(e),
+            diagnostics=diagnostics
+        )
 
 
 # =====================================
@@ -607,19 +671,25 @@ def delivery(date):
         + f"sec_bhavdata_full_{d}.csv"
     )
 
+    diagnostics = {}
+
     try:
 
-        df = download_report(url)
+        df = download_report(
+            url,
+            diagnostics
+        )
 
         required = {
             "SYMBOL",
             "DELIV_QTY"
         }
 
-        if not required.issubset(df.columns):
-
+        if not required.issubset(
+            df.columns
+        ):
             raise ValueError(
-                "Schema mismatch"
+                "Delivery schema mismatch"
             )
 
         date_col = next(
@@ -635,7 +705,6 @@ def delivery(date):
         )
 
         if date_col is None:
-
             raise ValueError(
                 "Date column missing"
             )
@@ -650,32 +719,25 @@ def delivery(date):
             df.empty
             or not dates.eq(date).all()
         ):
-
             raise ValueError(
-                "Report date mismatch"
+                "Delivery report date mismatch"
             )
 
-        return {
-            "source": "NSE Delivery",
-            "available": True,
-            "records": len(df),
-            "date": str(date),
-            "data": df,
-            "error": "",
-            "checked": now().isoformat()
-        }
+        return report_result(
+            "NSE Delivery",
+            date,
+            df,
+            diagnostics=diagnostics
+        )
 
-    except Exception as exc:
+    except Exception as e:
 
-        return {
-            "source": "NSE Delivery",
-            "available": False,
-            "records": 0,
-            "date": str(date),
-            "data": pd.DataFrame(),
-            "error": str(exc),
-            "checked": now().isoformat()
-        }
+        return report_result(
+            "NSE Delivery",
+            date,
+            error=str(e),
+            diagnostics=diagnostics
+        )
 
 
 # =====================================
@@ -688,14 +750,12 @@ def short_selling_csv(upload):
 
         return {
             "available": False,
-            "records": 0,
+            "records": None,
             "data": pd.DataFrame(),
             "error": "Official CSV required"
         }
 
     try:
-
-        upload.seek(0)
 
         df = pd.read_csv(upload)
 
@@ -732,14 +792,11 @@ def short_selling_csv(upload):
             None
         )
 
-        if not all(
-            [
-                symbol_col,
-                qty_col,
-                date_col
-            ]
-        ):
-
+        if not all([
+            symbol_col,
+            qty_col,
+            date_col
+        ]):
             raise ValueError(
                 "Unrecognized short selling schema"
             )
@@ -751,18 +808,15 @@ def short_selling_csv(upload):
         ).dt.date
 
         df["SHORT_QTY"] = pd.to_numeric(
-            df[qty_col].astype(str)
-            .str.replace(
-                ",",
-                "",
-                regex=False
-            ),
+            df[qty_col]
+            .astype(str)
+            .str.replace(",", "", regex=False),
             errors="coerce"
         )
 
         df["STOCK_SYMBOL"] = (
             df[symbol_col]
-            .astype("string")
+            .astype(str)
             .str.strip()
             .str.upper()
         )
@@ -771,14 +825,11 @@ def short_selling_csv(upload):
             df.empty
             or df["REPORT_DATE"].isna().any()
             or df["SHORT_QTY"].isna().any()
-            or df["STOCK_SYMBOL"].isna().any()
-            or df["STOCK_SYMBOL"].eq("").any()
             or (df["SHORT_QTY"] < 0).any()
             or (
                 df["REPORT_DATE"] > now().date()
             ).any()
         ):
-
             raise ValueError(
                 "Invalid short selling records"
             )
@@ -793,13 +844,13 @@ def short_selling_csv(upload):
             )
         }
 
-    except Exception as exc:
+    except Exception as e:
 
         return {
             "available": False,
-            "records": 0,
+            "records": None,
             "data": pd.DataFrame(),
-            "error": str(exc)
+            "error": str(e)
         }
 
 
@@ -827,7 +878,7 @@ def upstox_news(
 
         return result(
             "Upstox News",
-            error="No instruments"
+            error="No instruments selected"
         )
 
     headers = {
@@ -836,10 +887,14 @@ def upstox_news(
     }
 
     rows = []
-
     errors = []
+    diagnostics = {}
 
-    for i in range(0, len(keys), 30):
+    for i in range(
+        0,
+        len(keys),
+        30
+    ):
 
         batch = keys[i:i + 30]
 
@@ -852,35 +907,25 @@ def upstox_news(
                 data = get_json(
                     UP + "/v2/news",
                     {
-                        "category":
-                            "instrument_keys",
-
-                        "instrument_keys":
-                            ",".join(batch),
-
+                        "category": "instrument_keys",
+                        "instrument_keys": ",".join(
+                            batch
+                        ),
                         "page_number": page,
-
                         "page_size": 100
                     },
-                    headers
+                    headers=headers,
+                    diagnostics=diagnostics
                 )
 
-                if not isinstance(data, dict):
-
-                    raise ValueError(
-                        "Invalid news response"
-                    )
-
                 mapping = data.get(
-                    "data",
-                    {}
+                    "data", {}
                 )
 
                 if (
                     data.get("status") != "success"
                     or not isinstance(mapping, dict)
                 ):
-
                     raise ValueError(
                         "Invalid news response"
                     )
@@ -888,36 +933,29 @@ def upstox_news(
                 for key, articles in mapping.items():
 
                     if key not in batch:
-
                         continue
 
                     if not isinstance(
-                        articles,
-                        list
+                        articles, list
                     ):
-
                         continue
 
                     for article in articles:
 
                         if not isinstance(
-                            article,
-                            dict
+                            article, dict
                         ):
-
                             continue
 
                         rows.append({
                             "Instrument": key,
 
                             "Heading": article.get(
-                                "heading",
-                                ""
+                                "heading", ""
                             ),
 
                             "Summary": article.get(
-                                "summary",
-                                ""
+                                "summary", ""
                             ),
 
                             "Published": article.get(
@@ -925,20 +963,16 @@ def upstox_news(
                             ),
 
                             "URL": article.get(
-                                "article_link",
-                                ""
+                                "article_link", ""
                             ),
 
-                            "Impact":
-                                "REVIEW REQUIRED"
+                            "Impact": "REVIEW REQUIRED"
                         })
 
                 pages = data.get(
-                    "metadata",
-                    {}
+                    "metadata", {}
                 ).get(
-                    "page",
-                    {}
+                    "page", {}
                 ).get(
                     "total_pages"
                 )
@@ -948,11 +982,9 @@ def upstox_news(
                     if page >= int(pages):
 
                         complete = True
-
                         break
 
                 else:
-
                     break
 
             if not complete:
@@ -962,16 +994,15 @@ def upstox_news(
                     "Pagination unverified"
                 )
 
-        except Exception as exc:
+        except Exception as e:
 
-            message = str(exc).replace(
+            message = str(e).replace(
                 token,
                 "[REDACTED]"
             )
 
             errors.append(
                 f"Batch {i // 30 + 1}: "
-                f"{type(exc).__name__}: "
                 + message
             )
 
@@ -987,56 +1018,53 @@ def upstox_news(
             ]
         )
 
-        rows = df.to_dict(
-            "records"
-        )
+        rows = df.to_dict("records")
 
     return result(
         "Upstox News",
         rows,
-        "; ".join(errors)
+        "; ".join(errors),
+        diagnostics
     )
 
 
 # =====================================
-# SOURCE COVERAGE REPORT
+# SOURCE COVERAGE DIAGNOSTICS
 # =====================================
 
-def render_source_coverage(feeds):
+def source_status(feed):
 
-    if not feeds:
+    if not feed.get("available"):
 
-        return
+        return "DATA UNAVAILABLE"
+
+    if feed.get("records") == 0:
+
+        return "NO RECORDS RETURNED"
+
+    return "DATA RECEIVED"
+
+
+def diagnostics_frame(feeds):
 
     rows = []
 
     for feed in feeds:
 
-        if feed.get("available"):
-
-            status = (
-                "DATA RECEIVED"
-                if feed.get("records", 0) > 0
-                else "EMPTY RESPONSE"
-            )
-
-            records = feed.get(
-                "records",
-                0
-            )
-
-        else:
-
-            status = "DATA UNAVAILABLE"
-
-            records = None
+        diag = feed.get(
+            "diagnostics", {}
+        )
 
         rows.append({
-            "Source": feed.get("source"),
+            "Source": feed.get(
+                "source", ""
+            ),
 
-            "Status": status,
+            "Status": source_status(feed),
 
-            "Records": records,
+            "Records": feed.get(
+                "records"
+            ),
 
             "Report Date": feed.get(
                 "date",
@@ -1044,41 +1072,177 @@ def render_source_coverage(feeds):
             ),
 
             "Checked": feed.get(
-                "checked",
-                ""
+                "checked", ""
+            ),
+
+            "HTTP Status": diag.get(
+                "HTTP Status"
+            ),
+
+            "Final Host": diag.get(
+                "Final Host", ""
+            ),
+
+            "Initial URL": diag.get(
+                "Initial URL", ""
+            ),
+
+            "Final URL": diag.get(
+                "Final URL", ""
+            ),
+
+            "Content Type": diag.get(
+                "Content Type", ""
+            ),
+
+            "Redirect Count": len(
+                diag.get("Redirects", [])
+            ),
+
+            "Redirect History": str(
+                diag.get("Redirects", [])
             ),
 
             "Error": feed.get(
-                "error",
-                ""
+                "error", ""
             )
         })
 
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+# =====================================
+# REFRESH OFFICIAL SOURCES
+# =====================================
+
+def refresh_sources(date):
+
+    # Clear only intelligence caches.
+    # Existing live scanner remains untouched.
+
+    announcements.clear()
+    pre_open.clear()
+    deals.clear()
+    bhavcopy.clear()
+    delivery.clear()
+
+    tasks = [
+        (
+            "NSE Announcements",
+            lambda: announcements()
+        ),
+        (
+            "NSE Pre Open",
+            lambda: pre_open()
+        ),
+        (
+            "NSE BULK Deals",
+            lambda: deals(
+                "BULK",
+                date - timedelta(days=7),
+                date
+            )
+        ),
+        (
+            "NSE BLOCK Deals",
+            lambda: deals(
+                "BLOCK",
+                date - timedelta(days=7),
+                date
+            )
+        ),
+        (
+            "NSE CM Bhavcopy",
+            lambda: bhavcopy(
+                date, "CM"
+            )
+        ),
+        (
+            "NSE FO Bhavcopy",
+            lambda: bhavcopy(
+                date, "FO"
+            )
+        ),
+        (
+            "NSE Delivery",
+            lambda: delivery(date)
+        )
+    ]
+
+    feeds = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    for i, (name, function) in enumerate(
+        tasks
+    ):
+
+        status.caption(
+            "Checking " + name
+        )
+
+        try:
+
+            feed = function()
+
+        except Exception as e:
+
+            feed = result(
+                name,
+                error=str(e)
+            )
+
+        feeds.append(feed)
+
+        progress.progress(
+            (i + 1) / len(tasks)
+        )
+
+    progress.empty()
+    status.empty()
+
+    return feeds
+
+
+# =====================================
+# SOURCE COVERAGE DISPLAY
+# =====================================
+
+def render_source_coverage(feeds):
+
+    if not feeds:
+        return
 
     st.subheader(
-        "Intelligence Source Coverage"
+        "NSE Source Coverage"
     )
 
     available = sum(
-        bool(f.get("available"))
-        for f in feeds
+        bool(x.get("available"))
+        for x in feeds
     )
 
     unavailable = (
         len(feeds) - available
     )
 
+    total_records = sum(
+        x.get("records") or 0
+        for x in feeds
+        if x.get("available")
+    )
+
     a, b, c = st.columns(3)
 
     a.metric(
-        "Sources",
-        len(feeds)
+        "Available Sources",
+        f"{available}/{len(feeds)}"
     )
 
     b.metric(
-        "Available",
-        available
+        "Records Received",
+        total_records
     )
 
     c.metric(
@@ -1086,35 +1250,158 @@ def render_source_coverage(feeds):
         unavailable
     )
 
+    if unavailable:
+
+        st.warning(
+            "Some NSE sources are unavailable. "
+            "Unavailable data is not treated "
+            "as zero market activity."
+        )
+
+    diagnostics = diagnostics_frame(
+        feeds
+    )
+
     st.dataframe(
-        df,
+        diagnostics,
         hide_index=True,
         use_container_width=True
     )
 
     st.download_button(
         "Download Source Diagnostics",
-        df.to_csv(index=False),
-        "nse_intelligence_diagnostics.csv",
-        key="intel_source_diagnostics_v861"
+        diagnostics.to_csv(index=False),
+        "nse_source_diagnostics_v862.csv",
+        mime="text/csv",
+        key="intel_diagnostics_v862"
     )
 
 
 # =====================================
-# CLEAR INTELLIGENCE CACHE
+# INDIVIDUAL SOURCE DISPLAY
 # =====================================
 
-def clear_intelligence_cache():
+def render_feed(feed):
 
-    announcements.clear()
+    status = source_status(feed)
 
-    pre_open.clear()
+    if feed.get("available"):
 
-    deals.clear()
+        label = (
+            feed["source"]
+            + " | "
+            + str(feed.get("records", 0))
+            + " Records"
+        )
 
-    bhavcopy.clear()
+    else:
 
-    delivery.clear()
+        label = (
+            feed["source"]
+            + " | DATA UNAVAILABLE"
+        )
+
+    with st.expander(label):
+
+        if status == "DATA RECEIVED":
+
+            st.success(
+                "Data received"
+            )
+
+        elif status == "NO RECORDS RETURNED":
+
+            st.info(
+                "Valid response returned "
+                "no records. Coverage and "
+                "report timing must be checked."
+            )
+
+        else:
+
+            st.error(
+                feed.get(
+                    "error",
+                    "Unknown source error"
+                )
+            )
+
+        st.caption(
+            "Report date: "
+            + feed.get(
+                "date",
+                "Inspect individual records"
+            )
+        )
+
+        st.caption(
+            "Checked: "
+            + feed.get("checked", "")
+        )
+
+        diag = feed.get(
+            "diagnostics", {}
+        )
+
+        if diag:
+
+            st.write(
+                "HTTP Status:",
+                diag.get("HTTP Status")
+            )
+
+            st.write(
+                "Final Host:",
+                diag.get("Final Host")
+            )
+
+            st.write(
+                "Final URL:",
+                diag.get("Final URL")
+            )
+
+            st.write(
+                "Content Type:",
+                diag.get("Content Type")
+            )
+
+            if diag.get("Redirects"):
+
+                st.write(
+                    "Redirect History"
+                )
+
+                st.json(
+                    diag["Redirects"]
+                )
+
+        frame = feed.get("data")
+
+        if frame is None:
+
+            frame = pd.DataFrame(
+                feed.get("items", [])
+            )
+
+        if not frame.empty:
+
+            st.dataframe(
+                frame,
+                use_container_width=True
+            )
+
+            st.download_button(
+                "Download " + feed["source"],
+                frame.to_csv(index=False),
+                feed["source"].replace(
+                    " ", "_"
+                ) + ".csv",
+                mime="text/csv",
+                key=(
+                    "intel_v862_"
+                    + feed["source"]
+                )
+            )
 
 
 # =====================================
@@ -1127,237 +1414,174 @@ def render_intelligence(
 ):
 
     st.header(
-        "NSE MARKET INTELLIGENCE"
+        "NSE MARKET INTELLIGENCE V"
+        + VERSION
     )
 
     st.caption(
+        "Official market data research | "
+        "Secure NSE domain redirects | "
+        "No automatic orders"
+    )
+
+    st.success(
         "Intelligence Engine V"
         + VERSION
-        + " | Official Data Research"
-        + " | Safe Redirect Handling"
-        + " | No Automatic Orders"
+        + " Loaded"
+    )
+
+    st.caption(
+        "Primary NSE domain: "
+        + NSE
     )
 
     st.warning(
-        "Historical data is not live data. "
-        "Deals and short selling do not "
-        "independently establish CE/PE direction."
+        "Historical reports are not live data. "
+        "Bulk deals, block deals, delivery "
+        "and short selling do not independently "
+        "establish CE/PE direction."
     )
+
+    with st.expander(
+        "Connection Configuration"
+    ):
+
+        st.write(
+            "Engine Version:",
+            VERSION
+        )
+
+        st.write(
+            "NSE:",
+            NSE
+        )
+
+        st.write(
+            "NSE Archives:",
+            ARC
+        )
+
+        st.write(
+            "Upstox:",
+            UP
+        )
+
+        st.write(
+            "Allowed NSE Domains:",
+            sorted(NSE_HOSTS)
+        )
+
+        st.write(
+            "Maximum Redirects:",
+            MAX_REDIRECTS
+        )
+
+        st.caption(
+            "Upstox authorization is restricted "
+            "to the Upstox API host."
+        )
+
+    default_date = (
+        now().date()
+        - timedelta(days=1)
+    )
+
+    while default_date.weekday() >= 5:
+
+        default_date -= timedelta(days=1)
 
     date = st.date_input(
         "Historical Report Date",
-        now().date() - timedelta(days=1),
+        default_date,
         max_value=now().date(),
         key="intel_report_date"
     )
 
     if st.button(
         "REFRESH NSE INTELLIGENCE",
+        type="primary",
         key="intel_refresh"
     ):
 
-        clear_intelligence_cache()
-
         with st.spinner(
-            "Loading official market data..."
+            "Checking official market sources..."
         ):
 
-            st.session_state["intel_feeds"] = [
-                announcements(),
-
-                pre_open(),
-
-                deals(
-                    "BULK",
-                    date - timedelta(days=7),
-                    date
-                ),
-
-                deals(
-                    "BLOCK",
-                    date - timedelta(days=7),
-                    date
-                ),
-
-                bhavcopy(
-                    date,
-                    "CM"
-                ),
-
-                bhavcopy(
-                    date,
-                    "FO"
-                ),
-
-                delivery(date)
-            ]
+            st.session_state[
+                "intel_feeds"
+            ] = refresh_sources(date)
 
             st.session_state[
-                "intel_last_refresh"
-            ] = now().isoformat()
+                "intel_refresh_version"
+            ] = VERSION
+
+            st.session_state[
+                "intel_selected_date"
+            ] = str(date)
 
     feeds = st.session_state.get(
         "intel_feeds",
         []
     )
 
-    last_refresh = st.session_state.get(
-        "intel_last_refresh"
+    refresh_version = (
+        st.session_state.get(
+            "intel_refresh_version"
+        )
     )
 
-    if last_refresh:
+    if feeds and refresh_version != VERSION:
 
-        st.caption(
-            "Last refresh: "
-            + last_refresh
+        st.warning(
+            "Previous engine data detected. "
+            "Press REFRESH NSE INTELLIGENCE "
+            "to test the new version."
         )
+
+        feeds = []
 
     if feeds:
 
-        render_source_coverage(
-            feeds
+        selected_date = (
+            st.session_state.get(
+                "intel_selected_date"
+            )
         )
+
+        if selected_date != str(date):
+
+            st.warning(
+                "Selected date changed. "
+                "Refresh to load the new date."
+            )
+
+        render_source_coverage(feeds)
+
+        for feed in feeds:
+
+            render_feed(feed)
 
     else:
 
         st.info(
             "Press REFRESH NSE INTELLIGENCE "
-            "to load the latest available data."
-        )
-
-    for feed in feeds:
-
-        title = (
-            feed["source"]
-            + " | "
-            + (
-                str(feed["records"])
-                + " Records"
-                if feed["available"]
-                else "DATA UNAVAILABLE"
-            )
-        )
-
-        with st.expander(title):
-
-            if feed["available"]:
-
-                if feed["records"] > 0:
-
-                    st.success(
-                        "Data received"
-                    )
-
-                else:
-
-                    st.warning(
-                        "Empty response received. "
-                        "Completeness not established."
-                    )
-
-            else:
-
-                st.error(
-                    feed["error"]
-                )
-
-                st.caption(
-                    "Unavailable data must not "
-                    "be interpreted as zero activity."
-                )
-
-            st.caption(
-                "Report date: "
-                + feed.get(
-                    "date",
-                    "Inspect individual records"
-                )
-            )
-
-            st.caption(
-                "Checked: "
-                + feed.get(
-                    "checked",
-                    "Unknown"
-                )
-            )
-
-            frame = feed.get("data")
-
-            if frame is None:
-
-                frame = pd.DataFrame(
-                    feed.get(
-                        "items",
-                        []
-                    )
-                )
-
-            if not frame.empty:
-
-                st.dataframe(
-                    frame,
-                    use_container_width=True
-                )
-
-                st.download_button(
-                    "Download "
-                    + feed["source"],
-
-                    frame.to_csv(
-                        index=False
-                    ),
-
-                    feed["source"].replace(
-                        " ",
-                        "_"
-                    ) + ".csv",
-
-                    key=(
-                        "intel_"
-                        + feed["source"]
-                    )
-                )
-
-    # =================================
-    # OFFICIAL SOURCE LINKS
-    # =================================
-
-    with st.expander(
-        "Official NSE Source Links"
-    ):
-
-        st.markdown(
-            "[NSE Corporate Announcements]"
-            "(https://www.nseindia.com/"
-            "companies-listing/"
-            "corporate-filings-announcements)"
-        )
-
-        st.markdown(
-            "[NSE Bulk and Block Deals]"
-            "(https://www.nseindia.com/"
-            "report-detail/"
-            "display-bulk-and-block-deals)"
-        )
-
-        st.markdown(
-            "[NSE All Reports]"
-            "(https://www.nseindia.com/"
-            "all-reports)"
-        )
-
-        st.caption(
-            "Official website availability "
-            "does not guarantee API availability."
+            "to check all seven sources."
         )
 
     # =================================
     # SHORT SELLING
     # =================================
 
+    st.divider()
+
     st.subheader(
-        "Short Selling"
+        "NSE Short Selling"
+    )
+
+    st.caption(
+        "Official report upload required. "
+        "Automatic short selling feed "
+        "is not yet verified."
     )
 
     upload = st.file_uploader(
@@ -1394,8 +1618,9 @@ def render_intelligence(
                 short["data"].to_csv(
                     index=False
                 ),
-                "nse_short_selling_validated.csv",
-                key="intel_short_download"
+                "validated_short_selling.csv",
+                mime="text/csv",
+                key="short_download_v862"
             )
 
         else:
@@ -1407,6 +1632,8 @@ def render_intelligence(
     # =================================
     # UPSTOX COMPANY NEWS
     # =================================
+
+    st.divider()
 
     st.subheader(
         "Upstox Company News"
@@ -1426,21 +1653,29 @@ def render_intelligence(
             key="intel_upstox_news"
         ):
 
-            keys = [
-                universe[s]
-                for s in symbols
-            ]
+            if not symbols:
 
-            with st.spinner(
-                "Fetching company news..."
-            ):
-
-                st.session_state[
-                    "intel_up_news"
-                ] = upstox_news(
-                    token,
-                    keys
+                st.warning(
+                    "Select at least one stock"
                 )
+
+            else:
+
+                keys = [
+                    universe[s]
+                    for s in symbols
+                ]
+
+                with st.spinner(
+                    "Fetching Upstox company news..."
+                ):
+
+                    st.session_state[
+                        "intel_up_news"
+                    ] = upstox_news(
+                        token,
+                        keys
+                    )
 
         news = st.session_state.get(
             "intel_up_news"
@@ -1448,40 +1683,47 @@ def render_intelligence(
 
         if news:
 
-            if news["error"]:
+            if news.get("error"):
 
                 st.warning(
                     news["error"]
                 )
 
-            if news["available"]:
-
-                st.success(
-                    "News response received"
-                )
-
-            elif news["records"] > 0:
-
-                st.warning(
-                    "PARTIAL NEWS DATA"
-                )
-
-            else:
-
-                st.error(
-                    "NEWS DATA UNAVAILABLE"
-                )
+            items = news.get(
+                "items", []
+            )
 
             st.metric(
                 "News Records Received",
-                news["records"]
+                len(items)
             )
 
-            frame = pd.DataFrame(
-                news["items"]
+            st.caption(
+                "Checked: "
+                + news.get("checked", "")
             )
 
-            if not frame.empty:
+            if items:
+
+                frame = pd.DataFrame(
+                    items
+                )
+
+                reverse = {
+                    value: key
+                    for key, value
+                    in universe.items()
+                }
+
+                if "Instrument" in frame:
+
+                    frame.insert(
+                        0,
+                        "Symbol",
+                        frame["Instrument"].map(
+                            reverse
+                        )
+                    )
 
                 st.dataframe(
                     frame,
@@ -1489,34 +1731,44 @@ def render_intelligence(
                 )
 
                 st.download_button(
-                    "Download Upstox News",
-                    frame.to_csv(
-                        index=False
-                    ),
+                    "Download Company News",
+                    frame.to_csv(index=False),
                     "upstox_company_news.csv",
-                    key="intel_news_download"
+                    mime="text/csv",
+                    key="up_news_download_v862"
+                )
+
+            elif not news.get("error"):
+
+                st.info(
+                    "No news records returned."
                 )
 
     else:
 
         st.info(
-            "Upstox token and instrument "
-            "universe required."
+            "Upstox token and F&O universe "
+            "required for company news."
         )
+
+    # =================================
+    # SAFETY FOOTER
+    # =================================
 
     st.divider()
 
     st.info(
         "Research only. Intelligence records "
-        "do not automatically change "
-        "live trading scores."
+        "do not automatically change the "
+        "live trading score. Unavailable "
+        "sources are not assumed neutral."
     )
 
     st.caption(
-        "NSE Intelligence Engine V"
+        "NSE Intelligence V"
         + VERSION
-        + " | Redirect Protection"
+        + " | Secure Redirects"
         + " | Source Diagnostics"
-        + " | Historical Report Validation"
+        + " | Historical Date Validation"
         + " | No Automatic Orders"
     )
