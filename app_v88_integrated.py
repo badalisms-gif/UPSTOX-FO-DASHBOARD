@@ -1,5 +1,7 @@
+
 import ast
 import sys
+import inspect
 from pathlib import Path
 from datetime import time
 
@@ -7,7 +9,7 @@ import streamlit as st
 
 
 # ==========================================
-# NSE F&O PRO V8.8
+# NSE F&O PRO V8.8.1
 # EXTENDED MARKET SESSION
 # MANUAL POSITION SIZING
 # ==========================================
@@ -17,10 +19,16 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-REVISION = "8.8"
+REVISION = "8.8.1"
 
 PREVIOUS_APP = BASE_DIR / "app_v87_integrated.py"
 
+
+# ==========================================
+# MARKET SESSION CONFIGURATION
+# ==========================================
+
+MARKET_START = time(9, 15)
 ENTRY_START = time(9, 30)
 ENTRY_END = time(15, 15)
 EOD_TIME = time(15, 25)
@@ -28,16 +36,106 @@ MARKET_END = time(15, 30)
 
 
 # ==========================================
-# TIMING TRANSFORMATION
+# LOAD EXISTING V8.7 ENGINE
+# ==========================================
+
+def load_v87():
+
+    if not PREVIOUS_APP.exists():
+        raise FileNotFoundError(
+            "app_v87_integrated.py not found"
+        )
+
+    source = PREVIOUS_APP.read_text(
+        encoding="utf-8-sig"
+    )
+
+    tree = ast.parse(source)
+
+    imports = []
+    functions = []
+    constants = []
+
+    for node in tree.body:
+
+        if isinstance(
+            node,
+            (ast.Import, ast.ImportFrom)
+        ):
+            imports.append(node)
+
+        elif isinstance(
+            node,
+            ast.FunctionDef
+        ):
+            functions.append(node)
+
+        elif isinstance(node, ast.Assign):
+
+            try:
+                ast.literal_eval(node.value)
+                constants.append(node)
+
+            except (ValueError, TypeError):
+                pass
+
+    module = ast.Module(
+        body=imports + constants + functions,
+        type_ignores=[]
+    )
+
+    ast.fix_missing_locations(module)
+
+    namespace = {
+        "__file__": str(PREVIOUS_APP),
+        "__name__": "v87_loader",
+        "BASE_DIR": BASE_DIR,
+        "REVISION": "8.7",
+        "inspect": inspect
+    }
+
+    exec(
+        compile(
+            module,
+            str(PREVIOUS_APP),
+            "exec"
+        ),
+        namespace
+    )
+
+    namespace["BASE_DIR"] = BASE_DIR
+
+    required = [
+        "load_v86",
+        "integrate_v87"
+    ]
+
+    for name in required:
+
+        if not callable(namespace.get(name)):
+
+            raise RuntimeError(
+                f"Missing V8.7 function: {name}"
+            )
+
+    return namespace
+
+
+# ==========================================
+# MARKET TIMING TRANSFORMATION
 # ==========================================
 
 class SessionTiming(ast.NodeTransformer):
 
     def __init__(self):
+
         self.entry_changes = 0
         self.eod_changes = 0
+        self.snapshot_changes = 0
 
     def visit_FunctionDef(self, node):
+
+        # New entries: 09:30 to 15:15
 
         if node.name == "entry_window":
 
@@ -55,14 +153,19 @@ def entry_window(token):
             self.entry_changes += 1
 
             return ast.copy_location(
-                replacement, node
+                replacement,
+                node
             )
+
+        # Existing signal tracking: 15:25
 
         if node.name == "track":
 
             for item in ast.walk(node):
 
-                if not isinstance(item, ast.Call):
+                if not isinstance(
+                    item, ast.Call
+                ):
                     continue
 
                 if not isinstance(
@@ -94,11 +197,34 @@ def entry_window(token):
 
                     self.eod_changes += 1
 
+        # Option snapshots:
+        # Full normal market session
+
+        if node.name == "v87_snapshot_batch":
+
+            for item in ast.walk(node):
+
+                if not isinstance(
+                    item, ast.Call
+                ):
+                    continue
+
+                if not isinstance(
+                    item.func, ast.Name
+                ):
+                    continue
+
+                if item.func.id == "entry_window":
+
+                    item.func.id = "open_market"
+
+                    self.snapshot_changes += 1
+
         return self.generic_visit(node)
 
 
 # ==========================================
-# UPDATE INTEGRATED SOURCE
+# UPDATE INTEGRATED DASHBOARD
 # ==========================================
 
 def update_source(source):
@@ -112,31 +238,34 @@ def update_source(source):
     ast.fix_missing_locations(tree)
 
     if transformer.entry_changes != 1:
+
         raise RuntimeError(
-            "Entry window could not be "
-            "verified safely."
+            "Entry window verification failed"
         )
 
     if transformer.eod_changes != 1:
+
         raise RuntimeError(
-            "EOD timing could not be "
-            "verified safely."
+            "EOD timing verification failed"
+        )
+
+    if transformer.snapshot_changes < 1:
+
+        raise RuntimeError(
+            "Snapshot timing verification failed"
         )
 
     source = ast.unparse(tree)
 
     source = source.replace(
         "V8.7 Strategy Engine",
-        "V8.8 Strategy Engine"
+        "V8.8.1 Strategy Engine"
     )
 
     source = source.replace(
         "Balanced V8.7",
-        "Balanced V8.8"
+        "Balanced V8.8.1"
     )
-
-    # Preserve existing V8.7 manual sizing.
-    # No new capital or risk rejection.
 
     timing_panel = """
 
@@ -144,35 +273,52 @@ with st.sidebar:
 
     st.divider()
 
-    st.header("V8.8 Market Timing")
+    st.header("V8.8.1 Market Timing")
 
     st.success(
-        "Extended session enabled"
+        "Extended market session enabled"
     )
 
     st.write("Market Open: 09:15 AM")
+
     st.write("Entry Start: 09:30 AM")
+
     st.write("Entry Cutoff: 03:15 PM")
+
     st.write("EOD Observation: 03:25 PM")
+
     st.write("Market Close: 03:30 PM")
 
-    st.info(
-        "Manual position sizing. "
-        "Existing V8.7 strategy and "
-        "risk settings retained."
+    st.write(
+        "Option Snapshots: 09:15 AM - 03:30 PM"
+    )
+
+    st.success(
+        "Manual Position Sizing"
     )
 
     st.caption(
+        "Existing V8.7 signal qualification "
+        "and manual risk settings retained."
+    )
+
+    st.caption(
+        "Entry, Target, SL, Greeks, OI, "
+        "Volume and Premium Momentum retained."
+    )
+
+    st.warning(
         "Research signals only. "
         "No automatic orders."
     )
+
 """
 
     source += timing_panel
 
     compile(
         source,
-        "app_v88_runtime.py",
+        "app_v881_runtime.py",
         "exec"
     )
 
@@ -180,94 +326,7 @@ with st.sidebar:
 
 
 # ==========================================
-# LOAD EXISTING V8.7 INTEGRATION
-# ==========================================
-
-def load_v87():
-
-    if not PREVIOUS_APP.exists():
-
-        raise FileNotFoundError(
-            "app_v87_integrated.py not found"
-        )
-
-    source = PREVIOUS_APP.read_text(
-        encoding="utf-8-sig"
-    )
-
-    tree = ast.parse(source)
-
-    imports = [
-        node for node in tree.body
-        if isinstance(
-            node,
-            (ast.Import, ast.ImportFrom)
-        )
-    ]
-
-    functions = [
-        node for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-    ]
-
-    available = {
-        node.name for node in functions
-    }
-
-    if "integrate_v87" not in available:
-
-        raise RuntimeError(
-            "Expected integrate_v87 function "
-            "not found in V8.7."
-        )
-
-    module = ast.Module(
-        body=imports + functions,
-        type_ignores=[]
-    )
-
-    ast.fix_missing_locations(module)
-
-    namespace = {
-        "__file__": str(PREVIOUS_APP),
-        "__name__": "v87_loader",
-        "BASE_DIR": BASE_DIR,
-        "REVISION": "8.7"
-    }
-
-    # Preserve top-level literal constants
-    # required by the previous integration.
-
-    for node in tree.body:
-
-        if not isinstance(node, ast.Assign):
-            continue
-
-        try:
-            value = ast.literal_eval(node.value)
-        except (ValueError, TypeError):
-            continue
-
-        for target in node.targets:
-
-            if isinstance(target, ast.Name):
-
-                namespace[target.id] = value
-
-    exec(
-        compile(
-            module,
-            str(PREVIOUS_APP),
-            "exec"
-        ),
-        namespace
-    )
-
-    return namespace
-
-
-# ==========================================
-# BUILD AND RUN DASHBOARD
+# BUILD COMPLETE V8.8.1 ENGINE
 # ==========================================
 
 def main():
@@ -286,17 +345,69 @@ def main():
         encoding="utf-8-sig"
     )
 
+    # Load previous V8.6 integration
+
+    previous = namespace["load_v86"]()
+
+    if not isinstance(previous, dict):
+
+        raise RuntimeError(
+            "V8.6 loader returned invalid data"
+        )
+
+    # Corrected V8.7 integration call
+
     integrated_source = namespace[
         "integrate_v87"
-    ](base_source)
+    ](
+        base_source,
+        previous
+    )
 
     if not isinstance(
         integrated_source, str
     ):
 
         raise RuntimeError(
-            "V8.7 did not return valid source"
+            "V8.7 integration returned "
+            "invalid source"
         )
+
+    # Restore helper functions from
+    # previous integration layers
+
+    helper_names = (
+        "load_local_module",
+        "locate_module",
+        "available_files",
+        "load_v84",
+        "inspect"
+    )
+
+    for name in helper_names:
+
+        if name in previous:
+
+            namespace[name] = previous[name]
+
+    if callable(previous.get("load_previous")):
+
+        older = previous["load_previous"]()
+
+        if isinstance(older, dict):
+
+            for name in helper_names:
+
+                if (
+                    name not in namespace
+                    and name in older
+                ):
+
+                    namespace[name] = older[name]
+
+    namespace["inspect"] = inspect
+
+    # Apply extended market timing
 
     final_source = update_source(
         integrated_source
@@ -310,10 +421,12 @@ def main():
         BASE_DIR / "app_v88_integrated.py"
     )
 
+    # Run complete integrated dashboard
+
     exec(
         compile(
             final_source,
-            "app_v88_runtime.py",
+            "app_v881_runtime.py",
             "exec"
         ),
         namespace
@@ -321,7 +434,7 @@ def main():
 
 
 # ==========================================
-# START APPLICATION
+# APPLICATION START
 # ==========================================
 
 try:
@@ -331,17 +444,41 @@ try:
 except Exception as e:
 
     st.error(
-        "V8.8 integration could not start."
+        "V8.8.1 integration could not start."
     )
 
     st.error(
         type(e).__name__
     )
 
+    if isinstance(
+        e,
+        (TypeError, NameError, FileNotFoundError)
+    ):
+
+        st.code(str(e)[:500])
+
+    elif isinstance(e, RuntimeError):
+
+        message = str(e)
+
+        safe_messages = (
+            "verification failed",
+            "not found",
+            "Missing V8.7 function",
+            "invalid data",
+            "invalid source"
+        )
+
+        if any(
+            x in message
+            for x in safe_messages
+        ):
+
+            st.code(message[:500])
+
     st.info(
-        "Existing V8.7 files are unchanged. "
-        "Check compatibility of the "
-        "V8.7 integration function."
+        "Existing V8.7 files remain unchanged."
     )
 
     st.stop()
