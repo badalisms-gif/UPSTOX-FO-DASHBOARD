@@ -1,8 +1,9 @@
 
-"""V8.5 Dashboard - Safe NSE Intelligence Integration."""
+"""V8.5 Dashboard - NSE Intelligence Loader Fix."""
 
 from pathlib import Path
 import ast
+import os
 import sys
 import importlib
 import importlib.util
@@ -10,15 +11,91 @@ import streamlit as st
 
 
 # =====================================
-# REPOSITORY PATH FIX
+# REPOSITORY DISCOVERY
 # =====================================
 
 BASE_DIR = Path(__file__).resolve().parent
 
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+REPO_DIRS = list(dict.fromkeys([
+    BASE_DIR,
+    Path.cwd().resolve(),
+    Path("/mount/src/upstox-fo-dashboard"),
+    Path("/mount/src/UPSTOX-FO-DASHBOARD")
+]))
+
+for folder in REPO_DIRS:
+
+    if folder.is_dir():
+
+        if str(folder) not in sys.path:
+            sys.path.insert(0, str(folder))
 
 importlib.invalidate_caches()
+
+
+# =====================================
+# FIND LOCAL PYTHON FILE
+# =====================================
+
+def find_local_file(filename):
+
+    for folder in REPO_DIRS:
+
+        path = folder / filename
+
+        if path.is_file():
+            return path.resolve()
+
+    for folder in REPO_DIRS:
+
+        if not folder.is_dir():
+            continue
+
+        if folder == Path("/"):
+            continue
+
+        try:
+
+            for path in folder.iterdir():
+
+                if (
+                    path.is_file()
+                    and path.name.strip() == filename
+                ):
+                    return path.resolve()
+
+        except OSError:
+            continue
+
+    return None
+
+
+# =====================================
+# DEPLOYMENT DIAGNOSTICS
+# =====================================
+
+def deployment_details():
+
+    details = {}
+
+    for folder in REPO_DIRS:
+
+        if not folder.is_dir():
+            continue
+
+        try:
+
+            details[str(folder)] = sorted(
+                repr(p.name)
+                for p in folder.iterdir()
+                if p.is_file()
+            )
+
+        except OSError as exc:
+
+            details[str(folder)] = str(exc)
+
+    return details
 
 
 # =====================================
@@ -27,19 +104,20 @@ importlib.invalidate_caches()
 
 def load_local_module(name):
 
-    path = BASE_DIR / (name + ".py")
+    filename = name + ".py"
 
-    if not path.is_file():
+    path = find_local_file(filename)
 
-        available = sorted(
-            p.name
-            for p in BASE_DIR.glob("*.py")
-        )
+    if path is None:
 
         raise FileNotFoundError(
-            f"Missing deployed file: {path.name}. "
-            f"Available Python files: {available}"
+            f"{filename} not found in deployed files"
         )
+
+    parent = str(path.parent)
+
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
 
     importlib.invalidate_caches()
 
@@ -48,7 +126,9 @@ def load_local_module(name):
     if existing is not None:
 
         existing_path = getattr(
-            existing, "__file__", None
+            existing,
+            "__file__",
+            None
         )
 
         if (
@@ -63,13 +143,12 @@ def load_local_module(name):
     )
 
     if spec is None or spec.loader is None:
+
         raise ImportError(
-            f"Cannot load {path.name}"
+            f"Cannot load {path}"
         )
 
-    module = importlib.util.module_from_spec(
-        spec
-    )
+    module = importlib.util.module_from_spec(spec)
 
     sys.modules[name] = module
 
@@ -91,9 +170,12 @@ def load_local_module(name):
 
 def load_v84():
 
-    path = BASE_DIR / "app_v84_integrated.py"
+    path = find_local_file(
+        "app_v84_integrated.py"
+    )
 
-    if not path.is_file():
+    if path is None:
+
         raise FileNotFoundError(
             "app_v84_integrated.py not found"
         )
@@ -105,12 +187,17 @@ def load_v84():
     tree = ast.parse(source)
 
     functions = [
+
         node for node in tree.body
+
         if isinstance(node, ast.FunctionDef)
+
         and node.name == "integrate"
+
     ]
 
     if len(functions) != 1:
+
         raise ValueError(
             "V8.4 integration function not found"
         )
@@ -120,9 +207,7 @@ def load_v84():
         type_ignores=[]
     )
 
-    module = ast.fix_missing_locations(
-        module
-    )
+    module = ast.fix_missing_locations(module)
 
     namespace = {}
 
@@ -161,8 +246,12 @@ def integrate_v85(source):
     extra = '''
 
 # =====================================
-# V8.5 NSE MARKET INTELLIGENCE
+# NSE MARKET INTELLIGENCE
 # =====================================
+
+intelligence_path = find_local_file(
+    "nse_intelligence_engine.py"
+)
 
 with st.sidebar:
 
@@ -170,17 +259,15 @@ with st.sidebar:
 
     st.header("V8.5 Research Modules")
 
+    st.caption("Loader revision: 8.5.2")
+
     show_nse_intelligence = st.checkbox(
         "Show NSE Market Intelligence",
         value=False,
         key="v85_intelligence"
     )
 
-    intelligence_path = (
-        BASE_DIR / "nse_intelligence_engine.py"
-    )
-
-    if intelligence_path.is_file():
+    if intelligence_path is not None:
 
         st.success(
             "NSE Intelligence file detected"
@@ -189,8 +276,32 @@ with st.sidebar:
     else:
 
         st.error(
-            "NSE Intelligence file missing "
-            "from deployed repository"
+            "NSE Intelligence file not found "
+            "in deployed repository"
+        )
+
+    with st.expander(
+        "Deployment Diagnostics",
+        expanded=intelligence_path is None
+    ):
+
+        st.write(
+            "Repository folder:",
+            str(BASE_DIR)
+        )
+
+        st.write(
+            "Working directory:",
+            str(Path.cwd())
+        )
+
+        st.write(
+            "Intelligence file:",
+            str(intelligence_path)
+        )
+
+        st.json(
+            deployment_details()
         )
 
 
@@ -216,22 +327,30 @@ if show_nse_intelligence:
 
             raise AttributeError(
                 "render_intelligence function "
-                "not found in "
-                "nse_intelligence_engine.py"
+                "not found"
             )
 
         st.success(
             "NSE Intelligence Engine loaded"
         )
 
-        intelligence_universe = (
-            get_fo_universe()
-        )
+        if not token:
 
-        render_function(
-            token=token,
-            universe=intelligence_universe
-        )
+            st.warning(
+                "Enter Upstox access token "
+                "for connected research."
+            )
+
+        else:
+
+            intelligence_universe = (
+                get_fo_universe()
+            )
+
+            render_function(
+                token=token,
+                universe=intelligence_universe
+            )
 
     except Exception as exc:
 
@@ -251,52 +370,26 @@ if show_nse_intelligence:
             + message
         )
 
-        st.warning(
-            "The existing live market dashboard "
-            "remains available. "
-            "Intelligence data is not verified."
-        )
-
-        with st.expander(
-            "Module Loading Diagnostics"
+        if isinstance(
+            exc,
+            ModuleNotFoundError
         ):
 
             st.write(
-                "Intelligence file present:",
-                intelligence_path.is_file()
+                "Missing module:",
+                getattr(exc, "name", "Unknown")
             )
 
-            st.write(
-                "Repository folder:",
-                str(BASE_DIR)
-            )
-
-            st.write(
-                "Python files detected:"
-            )
-
-            st.write(
-                sorted(
-                    p.name
-                    for p in BASE_DIR.glob("*.py")
-                )
-            )
-
-            if isinstance(
-                exc,
-                ModuleNotFoundError
-            ):
-
-                st.write(
-                    "Missing module:",
-                    getattr(exc, "name", "Unknown")
-                )
+        st.warning(
+            "Existing dashboard remains available. "
+            "Intelligence data is not verified."
+        )
 
     st.divider()
 
 
 st.caption(
-    "V8.5 | Live NSE Verification | "
+    "V8.5.2 | Live NSE Verification | "
     "Market Intelligence | Research Only | "
     "No Automatic Orders"
 )
@@ -312,9 +405,11 @@ st.caption(
 
 try:
 
-    original = BASE_DIR / "app_v2.py"
+    original = find_local_file(
+        "app_v2.py"
+    )
 
-    if not original.is_file():
+    if original is None:
 
         raise FileNotFoundError(
             "Original app_v2.py not found"
@@ -341,6 +436,10 @@ except Exception as exc:
         + type(exc).__name__
         + ": "
         + str(exc)
+    )
+
+    st.json(
+        deployment_details()
     )
 
     st.stop()
