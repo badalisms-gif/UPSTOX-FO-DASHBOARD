@@ -1,0 +1,785 @@
+
+import io
+import zipfile
+import requests
+import pandas as pd
+import streamlit as st
+
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
+
+NSE = "https://www.nseindia.com"
+ARC = "https://nsearchives.nseindia.com"
+UP = "https://api.upstox.com"
+
+HEADERS = {
+    "User-Agent": "FNO-Data-Research/4.0",
+    "Accept": "application/json, text/plain, */*"
+}
+
+
+def now():
+    return datetime.now(IST)
+
+
+def result(source, rows=None, error=""):
+    rows = rows if rows is not None else []
+
+    return {
+        "source": source,
+        "available": not bool(error),
+        "records": len(rows),
+        "items": rows,
+        "error": error,
+        "checked": now().isoformat()
+    }
+
+
+def get_json(url, params=None, headers=None):
+
+    with requests.Session() as s:
+
+        r = s.get(
+            url,
+            params=params,
+            headers=headers or HEADERS,
+            timeout=(5, 12),
+            allow_redirects=False
+        )
+
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"HTTP {r.status_code}"
+            )
+
+        return r.json()
+
+
+def extract_rows(data):
+
+    if isinstance(data, list):
+        rows = data
+
+    elif isinstance(data, dict):
+
+        rows = None
+
+        for key in (
+            "data",
+            "Table",
+            "bulkDeals",
+            "blockDeals",
+            "bulk_deals",
+            "block_deals"
+        ):
+
+            if isinstance(data.get(key), list):
+                rows = data[key]
+                break
+
+        if rows is None:
+            raise ValueError("Unknown response schema")
+
+    else:
+        raise ValueError("Invalid response")
+
+    if not all(isinstance(x, dict) for x in rows):
+        raise ValueError("Invalid record schema")
+
+    return rows
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def announcements():
+
+    try:
+
+        data = get_json(
+            NSE + "/api/corporate-announcements",
+            {"index": "equities"}
+        )
+
+        rows = extract_rows(data)
+
+        return result(
+            "NSE Announcements",
+            rows
+        )
+
+    except Exception as e:
+
+        return result(
+            "NSE Announcements",
+            error=str(e)
+        )
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def pre_open():
+
+    try:
+
+        data = get_json(
+            NSE + "/api/market-data-pre-open",
+            {"key": "FO"}
+        )
+
+        return result(
+            "NSE Pre Open",
+            extract_rows(data)
+        )
+
+    except Exception as e:
+
+        return result(
+            "NSE Pre Open",
+            error=str(e)
+        )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def deals(kind, start_date, end_date):
+
+    kind = kind.upper()
+
+    if kind not in ("BULK", "BLOCK"):
+        raise ValueError("Invalid deal type")
+
+    endpoint = (
+        "/api/historical/bulk-deals"
+        if kind == "BULK"
+        else "/api/historical/block-deals"
+    )
+
+    source = "NSE " + kind + " Deals"
+
+    try:
+
+        data = get_json(
+            NSE + endpoint,
+            {
+                "from": start_date.strftime(
+                    "%d-%m-%Y"
+                ),
+                "to": end_date.strftime(
+                    "%d-%m-%Y"
+                )
+            }
+        )
+
+        return result(
+            source,
+            extract_rows(data)
+        )
+
+    except Exception as e:
+
+        return result(
+            source,
+            error=str(e)
+        )
+
+
+def download_report(url):
+
+    r = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=(5, 25),
+        allow_redirects=False
+    )
+
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"HTTP {r.status_code}"
+        )
+
+    if r.content[:2] == b"PK":
+
+        with zipfile.ZipFile(
+            io.BytesIO(r.content)
+        ) as z:
+
+            files = [
+                x for x in z.infolist()
+                if x.filename.lower().endswith(
+                    ".csv"
+                )
+            ]
+
+            if not files:
+                raise ValueError("CSV not found")
+
+            if files[0].file_size > 100_000_000:
+                raise ValueError("Report too large")
+
+            with z.open(files[0]) as f:
+                df = pd.read_csv(
+                    f,
+                    low_memory=False
+                )
+
+    else:
+
+        df = pd.read_csv(
+            io.BytesIO(r.content),
+            low_memory=False
+        )
+
+    df.columns = [
+        str(c).strip().upper()
+        for c in df.columns
+    ]
+
+    return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def bhavcopy(date, segment="CM"):
+
+    segment = segment.upper()
+
+    if segment not in ("CM", "FO"):
+        raise ValueError("Invalid segment")
+
+    d = date.strftime("%Y%m%d")
+
+    url = (
+        ARC + f"/content/{segment.lower()}/"
+        f"BhavCopy_NSE_{segment}_0_0_0_"
+        f"{d}_F_0000.csv.zip"
+    )
+
+    source = "NSE " + segment + " Bhavcopy"
+
+    try:
+
+        df = download_report(url)
+
+        required = {
+            "TCKRSYMB",
+            "TRADDT",
+            "CLSPRIC"
+        }
+
+        if segment == "FO":
+            required.add("OPNINTRST")
+
+        if not required.issubset(df.columns):
+            raise ValueError("Schema mismatch")
+
+        dates = pd.to_datetime(
+            df["TRADDT"],
+            errors="coerce"
+        ).dt.date
+
+        if df.empty or not dates.eq(date).all():
+            raise ValueError("Report date mismatch")
+
+        return {
+            "source": source,
+            "available": True,
+            "records": len(df),
+            "date": str(date),
+            "data": df,
+            "error": ""
+        }
+
+    except Exception as e:
+
+        return {
+            "source": source,
+            "available": False,
+            "records": 0,
+            "date": str(date),
+            "data": pd.DataFrame(),
+            "error": str(e)
+        }
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def delivery(date):
+
+    d = date.strftime("%d%m%Y")
+
+    url = (
+        ARC + "/products/content/"
+        f"sec_bhavdata_full_{d}.csv"
+    )
+
+    try:
+
+        df = download_report(url)
+
+        required = {
+            "SYMBOL",
+            "DELIV_QTY"
+        }
+
+        if not required.issubset(df.columns):
+            raise ValueError("Schema mismatch")
+
+        date_col = next(
+            (
+                c for c in (
+                    "DATE1",
+                    "DATE",
+                    "TRADDT"
+                )
+                if c in df.columns
+            ),
+            None
+        )
+
+        if date_col is None:
+            raise ValueError("Date column missing")
+
+        dates = pd.to_datetime(
+            df[date_col],
+            dayfirst=True,
+            errors="coerce"
+        ).dt.date
+
+        if df.empty or not dates.eq(date).all():
+            raise ValueError("Report date mismatch")
+
+        return {
+            "source": "NSE Delivery",
+            "available": True,
+            "records": len(df),
+            "date": str(date),
+            "data": df,
+            "error": ""
+        }
+
+    except Exception as e:
+
+        return {
+            "source": "NSE Delivery",
+            "available": False,
+            "records": 0,
+            "date": str(date),
+            "data": pd.DataFrame(),
+            "error": str(e)
+        }
+
+
+def short_selling_csv(upload):
+
+    if upload is None:
+
+        return {
+            "available": False,
+            "records": 0,
+            "data": pd.DataFrame(),
+            "error": "Official CSV required"
+        }
+
+    try:
+
+        df = pd.read_csv(upload)
+
+        df.columns = [
+            str(c).strip().upper()
+            for c in df.columns
+        ]
+
+        symbol_col = next(
+            (
+                c for c in df.columns
+                if c in (
+                    "SYMBOL",
+                    "SECURITY SYMBOL"
+                )
+            ),
+            None
+        )
+
+        qty_col = next(
+            (
+                c for c in df.columns
+                if "QTY" in c
+                or "QUANTITY" in c
+            ),
+            None
+        )
+
+        date_col = next(
+            (
+                c for c in df.columns
+                if "DATE" in c
+            ),
+            None
+        )
+
+        if not all(
+            [symbol_col, qty_col, date_col]
+        ):
+            raise ValueError(
+                "Unrecognized short selling schema"
+            )
+
+        df["REPORT_DATE"] = pd.to_datetime(
+            df[date_col],
+            dayfirst=True,
+            errors="coerce"
+        ).dt.date
+
+        df["SHORT_QTY"] = pd.to_numeric(
+            df[qty_col].astype(str)
+            .str.replace(",", "", regex=False),
+            errors="coerce"
+        )
+
+        df["STOCK_SYMBOL"] = (
+            df[symbol_col].astype(str)
+            .str.strip().str.upper()
+        )
+
+        if (
+            df.empty
+            or df["REPORT_DATE"].isna().any()
+            or df["SHORT_QTY"].isna().any()
+            or (df["SHORT_QTY"] < 0).any()
+            or (
+                df["REPORT_DATE"] > now().date()
+            ).any()
+        ):
+            raise ValueError(
+                "Invalid short selling records"
+            )
+
+        return {
+            "available": True,
+            "records": len(df),
+            "data": df,
+            "error": "",
+            "date": str(
+                df["REPORT_DATE"].max()
+            )
+        }
+
+    except Exception as e:
+
+        return {
+            "available": False,
+            "records": 0,
+            "data": pd.DataFrame(),
+            "error": str(e)
+        }
+
+
+def upstox_news(token, instrument_keys):
+
+    if not token:
+        return result(
+            "Upstox News",
+            error="Access token required"
+        )
+
+    keys = list(
+        dict.fromkeys(instrument_keys)
+    )
+
+    if not keys:
+        return result(
+            "Upstox News",
+            error="No instruments"
+        )
+
+    headers = {
+        "Authorization": "Bearer " + token,
+        "Accept": "application/json"
+    }
+
+    rows = []
+    errors = []
+
+    for i in range(0, len(keys), 30):
+
+        batch = keys[i:i + 30]
+
+        try:
+
+            complete = False
+
+            for page in range(1, 4):
+
+                data = get_json(
+                    UP + "/v2/news",
+                    {
+                        "category": "instrument_keys",
+                        "instrument_keys": ",".join(batch),
+                        "page_number": page,
+                        "page_size": 100
+                    },
+                    headers
+                )
+
+                mapping = data.get("data", {})
+
+                if (
+                    data.get("status") != "success"
+                    or not isinstance(mapping, dict)
+                ):
+                    raise ValueError(
+                        "Invalid news response"
+                    )
+
+                for key, articles in mapping.items():
+
+                    if key not in batch:
+                        continue
+
+                    if not isinstance(articles, list):
+                        continue
+
+                    for article in articles:
+
+                        if not isinstance(article, dict):
+                            continue
+
+                        rows.append({
+                            "Instrument": key,
+                            "Heading": article.get(
+                                "heading", ""
+                            ),
+                            "Summary": article.get(
+                                "summary", ""
+                            ),
+                            "Published": article.get(
+                                "published_time"
+                            ),
+                            "URL": article.get(
+                                "article_link", ""
+                            ),
+                            "Impact": "REVIEW REQUIRED"
+                        })
+
+                pages = data.get(
+                    "metadata", {}
+                ).get(
+                    "page", {}
+                ).get("total_pages")
+
+                if pages is not None:
+
+                    if page >= int(pages):
+                        complete = True
+                        break
+
+                else:
+                    break
+
+            if not complete:
+                errors.append(
+                    f"Batch {i // 30 + 1}: "
+                    "Pagination unverified"
+                )
+
+        except Exception as e:
+
+            errors.append(
+                f"Batch {i // 30 + 1}: "
+                f"{type(e).__name__}"
+            )
+
+    if rows:
+
+        df = pd.DataFrame(rows)
+
+        df = df.drop_duplicates(
+            subset=[
+                "Instrument",
+                "Heading",
+                "Published"
+            ]
+        )
+
+        rows = df.to_dict("records")
+
+    return result(
+        "Upstox News",
+        rows,
+        "; ".join(errors)
+    )
+
+
+def render_intelligence(
+    token="",
+    universe=None
+):
+
+    st.header("NSE MARKET INTELLIGENCE")
+
+    st.caption(
+        "Official data research | "
+        "No automatic orders"
+    )
+
+    st.warning(
+        "Historical data is not live data. "
+        "Deals and short selling do not "
+        "independently establish CE/PE direction."
+    )
+
+    date = st.date_input(
+        "Historical Report Date",
+        now().date() - timedelta(days=1),
+        key="intel_report_date"
+    )
+
+    if st.button(
+        "REFRESH NSE INTELLIGENCE",
+        key="intel_refresh"
+    ):
+
+        with st.spinner(
+            "Loading official market data..."
+        ):
+
+            st.session_state["intel_feeds"] = [
+                announcements(),
+                pre_open(),
+                deals(
+                    "BULK",
+                    date - timedelta(days=7),
+                    date
+                ),
+                deals(
+                    "BLOCK",
+                    date - timedelta(days=7),
+                    date
+                ),
+                bhavcopy(date, "CM"),
+                bhavcopy(date, "FO"),
+                delivery(date)
+            ]
+
+    feeds = st.session_state.get(
+        "intel_feeds", []
+    )
+
+    for feed in feeds:
+
+        with st.expander(
+            feed["source"]
+            + " | "
+            + str(feed["records"])
+            + " Records"
+        ):
+
+            if feed["available"]:
+                st.success("Data received")
+            else:
+                st.error(feed["error"])
+
+            st.caption(
+                "Report date: "
+                + feed.get(
+                    "date",
+                    "Inspect individual records"
+                )
+            )
+
+            frame = feed.get("data")
+
+            if frame is None:
+                frame = pd.DataFrame(
+                    feed.get("items", [])
+                )
+
+            if not frame.empty:
+
+                st.dataframe(
+                    frame,
+                    use_container_width=True
+                )
+
+                st.download_button(
+                    "Download " + feed["source"],
+                    frame.to_csv(index=False),
+                    feed["source"].replace(
+                        " ", "_"
+                    ) + ".csv",
+                    key="intel_" + feed["source"]
+                )
+
+    st.subheader("Short Selling")
+
+    upload = st.file_uploader(
+        "Official NSE Short Selling CSV",
+        type=["csv"],
+        key="intel_short_csv"
+    )
+
+    if upload is not None:
+
+        short = short_selling_csv(upload)
+
+        if short["available"]:
+
+            st.metric(
+                "Short Selling Records",
+                short["records"]
+            )
+
+            st.caption(
+                "Latest report date: "
+                + short["date"]
+            )
+
+            st.dataframe(short["data"])
+
+        else:
+            st.error(short["error"])
+
+    st.subheader("Upstox Company News")
+
+    if universe and token:
+
+        symbols = st.multiselect(
+            "Select stocks",
+            sorted(universe),
+            max_selections=30,
+            key="intel_news_symbols"
+        )
+
+        if st.button(
+            "FETCH COMPANY NEWS",
+            key="intel_upstox_news"
+        ):
+
+            keys = [
+                universe[s]
+                for s in symbols
+            ]
+
+            st.session_state["intel_up_news"] = (
+                upstox_news(token, keys)
+            )
+
+        news = st.session_state.get(
+            "intel_up_news"
+        )
+
+        if news:
+
+            if news["error"]:
+                st.warning(news["error"])
+
+            st.metric(
+                "News Records",
+                news["records"]
+            )
+
+            st.dataframe(
+                pd.DataFrame(news["items"])
+            )
+
+    st.info(
+        "Research only. These records do not "
+        "change the live trading score."
+    )
