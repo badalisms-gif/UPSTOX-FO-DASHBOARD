@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 import numpy as np
 
-def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv, option_setup, snapshots):
+def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv, option_setup, snapshots, futures):
     st.header("Institutional Intelligence")
     st.caption("Research watchlist only. Weekly short sales are not open short positions.")
     frames=[]
@@ -77,7 +77,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     table=pd.DataFrame(rows).sort_values(["Activity Cr","Short qty"],ascending=False)
     st.dataframe(table,use_container_width=True)
     st.download_button("Export disclosure shortlist",table.to_csv(index=False),"institutional_shortlist.csv")
-    st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Historical storage and futures OI are not yet implemented.")
+    st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Automatic permanent storage is not implemented. Futures confirmation requires fresh quotes and previous OI.")
     selected=st.multiselect("Stocks for live technical and news checks",table.Symbol.tolist(),default=table.Symbol.head(3).tolist(),max_selections=10)
     if st.button("Check technical and news"):
         if not token: st.error("Upstox token required"); return
@@ -113,6 +113,15 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
                                         row["Status"]="V7 QUALIFIED / Futures OI pending"
                                 except Exception as e:
                                     row["V7 verification"]=str(e)
+                try:
+                    row.update(futures(token,mapping[sym],side))
+                except Exception as e:
+                    row["Futures confirmed"]=False
+                    row["Futures verification"]=str(e)
+                if row["Status"]=="V7 QUALIFIED / Futures OI pending":
+                    row["Status"]="QUALIFIED RESEARCH" if row.get("Futures confirmed") else "WATCH ONLY / Futures unverified"
+                    if not row.get("Futures confirmed"):
+                        for field in ("Entry","SL","Target","Target 2","Lots","Lot Size","Planned Risk","Capital"): row.pop(field,None)
                 results.append(row)
             except Exception as e: results.append({"Symbol":sym,"Status":"UNVERIFIED","Reason":str(e)})
         out=pd.DataFrame(results)
@@ -121,4 +130,4 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
             st.subheader("Top "+side+" watchlist")
             if "Score" in out and "Side" in out:
                 st.dataframe(out[(out.Side==side)&out.Score.gt(0)].sort_values("Score",ascending=False),use_container_width=True)
-        st.caption("Heuristic watch score, not probability. V7 risk and quote checks applied where available. Futures OI confirmation remains pending; research only.")
+        st.caption("Heuristic watch score, not probability. V7 risk and quote checks applied where available. Futures OI confirmation required for qualified research; missing data blocks qualification.")
