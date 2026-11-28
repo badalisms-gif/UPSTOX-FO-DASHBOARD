@@ -27,4 +27,9 @@ class Storage:
 
 def records(frame,keys):
     rows=json.loads(frame.to_json(orient="records",date_format="iso"))
-    return [{"record_id":hashlib.sha256(json.dumps([r.get(k) for k in keys],sort_keys=True).encode()).hexdigest(),"payload":r} for r in rows]
+    unique={}
+    for r in rows:
+        values=[float(r[k]) if k in ("quantity","price") and r.get(k) is not None else r.get(k) for k in keys]
+        rid=hashlib.sha256(json.dumps(values,sort_keys=True).encode()).hexdigest()
+        unique[rid]={"record_id":rid,"payload":r}
+    return list(unique.values())
