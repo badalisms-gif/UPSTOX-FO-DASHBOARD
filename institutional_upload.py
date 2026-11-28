@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 import numpy as np
 
-def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv):
+def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv, option_setup, snapshots):
     st.header("Institutional Intelligence")
     st.caption("Research watchlist only. Weekly short sales are not open short positions.")
     frames=[]
@@ -95,11 +95,24 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
                     if exp:
                         c=chain(token,mapping[sym],exp)
                         if not c.empty:
-                            c=c[(c.Side==side)&c.Delta.abs().between(.35,.75)&c.Volume.ge(minvol)&c["Spread %"].le(spread)&c.IV.between(0,iv)&c.Bid.gt(0)&c.Ask.ge(c.Bid)&c.OI.gt(0)].copy()
+                            c=c[(c.Side==side)&c.Delta.abs().between(.35,.75)&c.Volume.ge(minvol)&c["Spread %"].le(spread)&c.IV.gt(0)&c.IV.le(iv)&((c.Delta>0) if side=="CE" else (c.Delta<0))&c.Bid.gt(0)&c.Ask.ge(c.Bid)&c.OI.gt(0)].copy()
                             if not c.empty:
                                 c["Distance"]=(c.Delta.abs()-.55).abs()
                                 o=c.sort_values(["Spread %","Distance","Volume"],ascending=[True,True,False]).iloc[0]
                                 row.update({"Status":"CE/PE WATCH","Score":round(80+10*(1-o["Spread %"]/spread)+10*(1-min(1,o.Distance/.4)),1),"Strike":o.Strike,"Expiry":exp,"Ask":o.Ask,"Delta":o.Delta,"Theta":o.Theta,"Gamma":o.Gamma,"Vega":o.Vega,"IV":o.IV,"OI":o.OI,"OI Change":o["Daily OI Change"],"Spread %":o["Spread %"]})
+                                snapshot_time=now()
+                                sk=mapping[sym]+"|"+exp
+                                old=snapshots.get(sk,{})
+                                snapshots[sk]={x.Key:{"time":snapshot_time,"OI":x.OI,"Volume":x.Volume,"LTP":x.LTP} for _,x in c.iterrows()}
+                                try:
+                                    v=option_setup(o,checks,metrics,c,exp,sym,old,n,"Institutional CSV",snapshot_time)
+                                    row["V7 verification"]=v["Status"]
+                                    if v["Status"]=="QUALIFIED":
+                                        for field in ("Entry","SL","Target","Target 2","Lots","Lot Size","Planned Risk","Capital"):
+                                            row[field]=v[field]
+                                        row["Status"]="V7 QUALIFIED / Futures OI pending"
+                                except Exception as e:
+                                    row["V7 verification"]=str(e)
                 results.append(row)
             except Exception as e: results.append({"Symbol":sym,"Status":"UNVERIFIED","Reason":str(e)})
         out=pd.DataFrame(results)
@@ -108,4 +121,4 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
             st.subheader("Top "+side+" watchlist")
             if "Score" in out and "Side" in out:
                 st.dataframe(out[(out.Side==side)&out.Score.gt(0)].sort_values("Score",ascending=False),use_container_width=True)
-        st.caption("Heuristic watch score, not probability. No entry signal; futures OI and fresh option quote verification pending.")
+        st.caption("Heuristic watch score, not probability. V7 risk and quote checks applied where available. Futures OI confirmation remains pending; research only.")
