@@ -3107,8 +3107,32 @@ if page == "Trading Journal":
 # V7 DASHBOARD FOOTER
 # =====================================
 
+def institutional_futures(token, key, side):
+    contracts = [x for x in master() if x.get("segment") == "NSE_FO" and x.get("instrument_type") == "FUT" and x.get("underlying_key") == key and x.get("expiry")]
+    def expiry_date(x):
+        v=x["expiry"]
+        return datetime.fromtimestamp(float(v)/1000, IST).date() if isinstance(v,(int,float)) else pd.Timestamp(v).date()
+    contracts = sorted([x for x in contracts if expiry_date(x)>now().date()],key=expiry_date)
+    if not contracts: raise RuntimeError("No non-expiring futures contract")
+    k=contracts[0]["instrument_key"]
+    q=quotes(token,[k]).get(k,{})
+    if not fresh(q): raise RuntimeError("Futures quote stale")
+    oi=n(q.get("oi"))
+    prev=n(q.get("oi_day_high")) # not used as previous OI
+    previous=n(q.get("prev_oi"))
+    if not np.isfinite(previous): previous=n(q.get("previous_oi"))
+    price=n(q.get("last_price"))
+    close=n((q.get("ohlc") or {}).get("close"))
+    if not np.isfinite([oi,previous,price,close]).all() or min(oi,previous,price,close)<=0:
+        raise RuntimeError("Previous futures OI or price unavailable")
+    pc=100*(price/close-1)
+    oc=100*(oi/previous-1)
+    label=("Long buildup" if oc>0 else "Short covering") if pc>0 else ("Short buildup" if oc>0 else "Long unwinding")
+    return {"Futures contract":k,"Futures price change %":round(pc,2),"Futures OI change %":round(oc,2),"Futures buildup":label,"Futures confirmed":bool(oc!=0 and ((pc>0 and side=="CE") or (pc<0 and side=="PE")))}
+
+
 if page == "Institutional Intelligence":
-    render_institutional(token, instrument_mapping, technical, automatic_news, expiry, chain, now, minvol, spread, iv, option_setup, S.snapshots)
+    render_institutional(token, instrument_mapping, technical, automatic_news, expiry, chain, now, minvol, spread, iv, option_setup, S.snapshots, institutional_futures)
 
 st.divider()
 
