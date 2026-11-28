@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 import numpy as np
 
-def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv, option_setup, snapshots, futures):
+def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv, option_setup, snapshots, futures, market_ranking=None):
     st.header("Institutional Intelligence")
     st.caption("Research watchlist only. Weekly short sales are not open short positions.")
     from institutional_storage import Storage, records
@@ -125,8 +125,20 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     st.dataframe(shown.reset_index(drop=True),use_container_width=True)
     st.download_button("Export disclosure shortlist",table.to_csv(index=False),"institutional_shortlist.csv")
     st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Database storage is enabled when configured. Futures confirmation requires fresh quotes and previous OI.")
+    priority=table.Symbol.tolist()
+    if market_ranking is not None and token and st.checkbox("Prioritize fresh market momentum (live)",value=True):
+        try:
+            if now().weekday()<5 and (9,15)<=(now().hour,now().minute)<(15,30):
+                ranked,_,_,_=market_ranking(token)
+                if not ranked.empty:
+                    ranked=ranked[ranked.Fresh.eq(True)&ranked.Symbol.isin(priority)&ranked.Side.isin(["CE","PE"])].copy()
+                    ranked=ranked.sort_values("Momentum Score",ascending=False)
+                    priority=ranked.Symbol.tolist()+[x for x in priority if x not in set(ranked.Symbol)]
+                    st.dataframe(ranked[["Symbol","Side","Change %","Momentum Score","Volume"]],use_container_width=True)
+            else: st.info("Live priority unavailable outside market hours; disclosure order is research only.")
+        except Exception: st.warning("Live priority unavailable; disclosure order is research only.")
     auto=st.checkbox("Auto scan every 5 minutes (keep dashboard open)",key="inst_auto")
-    selected=st.multiselect("Stocks for live technical and news checks",table.Symbol.tolist(),default=table.Symbol.head(3).tolist(),max_selections=10)
+    selected=st.multiselect("Stocks for live technical and news checks",table.Symbol.tolist(),default=priority[:3],max_selections=10)
     full=st.checkbox("Rotate through entire watchlist automatically",key="inst_full")
     batch_size=st.selectbox("Automatic scan batch size",[10,20,30],index=1)
     st.caption("Larger batches may take longer or hit API limits. Rankings use observations from the last 10 minutes only.")
@@ -137,7 +149,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
         manual=st.button("Check technical and news")
         batch=selected
         if auto and active and full and not manual:
-            symbols=table.Symbol.tolist()
+            symbols=priority
             cursor=st.session_state.get("inst_cursor",0)%len(symbols)
             batch=symbols[cursor:cursor+batch_size]
             st.session_state["inst_cursor"]=(cursor+len(batch))%len(symbols)
