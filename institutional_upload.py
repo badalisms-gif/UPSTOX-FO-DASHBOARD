@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 import numpy as np
 
-def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv, option_setup, snapshots, futures, market_ranking=None):
+def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv, option_setup, snapshots, futures, market_ranking=None, master_auto=False):
     st.header("Institutional Intelligence")
     st.caption("Research watchlist only. Weekly short sales are not open short positions.")
     from institutional_storage import Storage, records
@@ -137,9 +137,9 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
                     st.dataframe(ranked[["Symbol","Side","Change %","Momentum Score","Volume"]],use_container_width=True)
             else: st.info("Live priority unavailable outside market hours; disclosure order is research only.")
         except Exception: st.warning("Live priority unavailable; disclosure order is research only.")
-    auto=st.checkbox("Auto scan every 5 minutes (keep dashboard open)",key="inst_auto")
+    auto=st.checkbox("Auto scan every 5 minutes (keep dashboard open)",key="inst_auto") or master_auto
     selected=st.multiselect("Stocks for live technical and news checks",table.Symbol.tolist(),default=priority[:3],max_selections=10)
-    full=st.checkbox("Rotate through entire watchlist automatically",key="inst_full")
+    full=st.checkbox("Rotate through entire watchlist automatically",key="inst_full") or master_auto
     batch_size=st.selectbox("Automatic scan batch size",[10,20,30],index=1)
     st.caption("Larger batches may take longer or hit API limits. Rankings use observations from the last 10 minutes only.")
     @st.fragment(run_every="300s" if auto else None)
