@@ -89,7 +89,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     d=d.drop_duplicates(subset=["kind","date","symbol","client","side","quantity","price"])
     save("institutional_history",d,["kind","date","symbol","client","side","quantity","price"])
     st.download_button("Save updated historical archive",d.to_csv(index=False,date_format="%Y-%m-%d"),"institutional_history.csv")
-    st.caption("Download and restore this archive on your next visit. Streamlit session is not permanent storage.")
+    st.caption("Database storage is enabled when configured; download this archive as a backup.")
     try: mapping=universe()
     except Exception as e:
         st.error(f"F&O universe unavailable: {e}"); return
@@ -124,10 +124,12 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     if shown.empty: st.info("No matching F&O disclosures in this category for the selected date.")
     st.dataframe(shown.reset_index(drop=True),use_container_width=True)
     st.download_button("Export disclosure shortlist",table.to_csv(index=False),"institutional_shortlist.csv")
-    st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Automatic permanent storage is not implemented. Futures confirmation requires fresh quotes and previous OI.")
+    st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Database storage is enabled when configured. Futures confirmation requires fresh quotes and previous OI.")
     auto=st.checkbox("Auto scan every 5 minutes (keep dashboard open)",key="inst_auto")
     selected=st.multiselect("Stocks for live technical and news checks",table.Symbol.tolist(),default=table.Symbol.head(3).tolist(),max_selections=10)
     full=st.checkbox("Rotate through entire watchlist automatically",key="inst_full")
+    batch_size=st.selectbox("Automatic scan batch size",[10,20,30],index=1)
+    st.caption("Larger batches may take longer or hit API limits. Rankings use observations from the last 10 minutes only.")
     @st.fragment(run_every="300s" if auto else None)
     def monitor():
         t=now()
@@ -137,7 +139,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
         if auto and active and full and not manual:
             symbols=table.Symbol.tolist()
             cursor=st.session_state.get("inst_cursor",0)%len(symbols)
-            batch=symbols[cursor:cursor+10]
+            batch=symbols[cursor:cursor+batch_size]
             st.session_state["inst_cursor"]=(cursor+len(batch))%len(symbols)
         if manual or (auto and active):
             if not batch: st.info("Select at least one stock"); return
@@ -196,10 +198,14 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
             history.append(observed)
             st.session_state["institutional_observations"]=history
             st.dataframe(out,use_container_width=True)
+            recent=pd.concat(history,ignore_index=True)
+            recent=recent[pd.to_datetime(recent["Observed at"],utc=True,errors="coerce")>=pd.Timestamp(now()).tz_convert("UTC")-pd.Timedelta(minutes=10)]
+            recent=recent[recent.Symbol.isin(table.Symbol)].drop_duplicates("Symbol",keep="last")
+            st.write("Recently scanned unique stocks:",len(recent))
             for side in ("CE","PE"):
-                st.subheader("Top "+side+" watchlist")
-                if "Score" in out and "Side" in out:
-                    st.dataframe(out[(out.Side==side)&out.Score.gt(0)].sort_values("Score",ascending=False),use_container_width=True)
+                st.subheader("Top "+side+" watchlist (recent batches)")
+                if "Score" in recent and "Side" in recent:
+                    st.dataframe(recent[(recent.Side==side)&recent.Score.gt(0)].sort_values("Score",ascending=False),use_container_width=True)
             st.caption("Heuristic watch score, not probability. V7 risk and quote checks applied where available. Futures OI confirmation required for qualified research; missing data blocks qualification.")
 
         history=st.session_state.get("institutional_observations",[])
@@ -251,6 +257,6 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
             save("institutional_paper_results",paper,["Signal time","Option key"])
             st.dataframe(paper,use_container_width=True)
             st.download_button("Export paper outcomes",paper.to_csv(index=False),"institutional_paper_outcomes.csv")
-        st.caption("Periodic quote observations only; no orders, no assumed fills between checks, no permanent storage. Missed intraday touches remain unknown.")
+        st.caption("Periodic quote observations only; no orders, no assumed fills between checks. Missed intraday touches remain unknown.")
 
     monitor()
