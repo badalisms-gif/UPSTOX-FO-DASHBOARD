@@ -36,4 +36,20 @@ class TestUpload(unittest.TestCase):
         archive=pd.read_csv(io.StringIO(ui.exports[0][1]))
         self.assertEqual(len(archive),4)
 
+class TestStorage(unittest.TestCase):
+    def test_dedup_keys_and_save(self):
+        from institutional_storage import Storage, records
+        frame=pd.DataFrame([{"Symbol":"ABC","Score":1},{"Symbol":"ABC","Score":2}])
+        rows=records(frame,["Symbol"])
+        self.assertEqual(rows[0]["record_id"],rows[1]["record_id"])
+        db=Storage("https://example.invalid","test-key")
+        with patch("institutional_storage.requests.post") as post:
+            db.save("institutional_watchlist",rows[:1])
+            self.assertEqual(post.call_args.kwargs["json"],rows[:1])
+            post.return_value.raise_for_status.assert_called_once()
+        with patch("institutional_storage.requests.get") as get:
+            get.return_value.json.return_value=rows[:1]
+            self.assertEqual(db.load("institutional_watchlist"),rows[:1])
+        with self.assertRaises(ValueError): db.load("unknown")
+
 if __name__=="__main__": unittest.main()
