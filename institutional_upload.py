@@ -101,7 +101,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
                             if not c.empty:
                                 c["Distance"]=(c.Delta.abs()-.55).abs()
                                 o=c.sort_values(["Spread %","Distance","Volume"],ascending=[True,True,False]).iloc[0]
-                                row.update({"Status":"CE/PE WATCH","Score":round(80+10*(1-o["Spread %"]/spread)+10*(1-min(1,o.Distance/.4)),1),"Strike":o.Strike,"Expiry":exp,"Ask":o.Ask,"Delta":o.Delta,"Theta":o.Theta,"Gamma":o.Gamma,"Vega":o.Vega,"IV":o.IV,"OI":o.OI,"OI Change":o["Daily OI Change"],"Spread %":o["Spread %"]})
+                                row.update({"Status":"CE/PE WATCH","Score":round(80+10*(1-o["Spread %"]/spread)+10*(1-min(1,o.Distance/.4)),1),"Option key":o.Key,"Strike":o.Strike,"Expiry":exp,"Ask":o.Ask,"Delta":o.Delta,"Theta":o.Theta,"Gamma":o.Gamma,"Vega":o.Vega,"IV":o.IV,"OI":o.OI,"OI Change":o["Daily OI Change"],"Spread %":o["Spread %"]})
                                 snapshot_time=now()
                                 sk=mapping[sym]+"|"+exp
                                 old=snapshots.get(sk,{})
@@ -150,3 +150,43 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
         st.dataframe(latest,use_container_width=True)
         st.download_button("Export timestamped forward observations",pd.concat(history,ignore_index=True).to_csv(index=False),"institutional_forward_observations.csv")
         st.caption("Manual scans only. Counts are observations, not completed trade outcomes. Export before closing session.")
+
+    st.subheader("Paper signal outcome tracking")
+    ledger=st.session_state.get("institutional_paper_ledger",{})
+    if history:
+        for _,r in history[-1].iterrows():
+            if r.get("Status")!="QUALIFIED RESEARCH": continue
+            key=str(r.get("Option key",""))
+            if not key or key=="nan": continue
+            stamp=str(r["Observed at"])
+            signal_id=stamp[:10]+"|"+key
+            if signal_id not in ledger:
+                ledger[signal_id]={"Symbol":r["Symbol"],"Side":r["Side"],"Option key":key,"Expiry":r["Expiry"],"Signal time":stamp,"Entry":float(r["Entry"]),"SL":float(r["SL"]),"Target":float(r["Target"]),"State":"WAIT ENTRY"}
+    if ledger and st.button("Refresh paper outcomes"):
+        for trade in ledger.values():
+            if trade["State"] not in ("WAIT ENTRY","OPEN"): continue
+            try:
+                t=now()
+                if t.date().isoformat()!=trade["Signal time"][:10]:
+                    trade["State"]="UNRESOLVED / session ended"; continue
+                c=chain(token,mapping[trade["Symbol"]],trade["Expiry"])
+                q=c[c.Key.eq(trade["Option key"])]
+                if q.empty: continue
+                q=q.iloc[0]
+                bid,ask=float(q.Bid),float(q.Ask)
+                if not np.isfinite(bid) or not np.isfinite(ask) or bid<=0 or ask<bid: continue
+                trade["Last checked"]=t.isoformat()
+                if trade["State"]=="WAIT ENTRY" and trade["SL"]<ask<=trade["Entry"]:
+                    trade.update({"State":"OPEN","Observed entry":ask,"Entry time":t.isoformat()})
+                elif trade["State"]=="OPEN":
+                    outcome="TARGET" if bid>=trade["Target"] else "SL" if bid<=trade["SL"] else "EOD" if (t.hour,t.minute)>=(15,20) else None
+                    if outcome:
+                        trade.update({"State":outcome,"Observed exit":bid,"Exit time":t.isoformat(),"PnL per share":bid-trade["Observed entry"]})
+                if trade["State"]=="WAIT ENTRY" and (t.hour,t.minute)>=(15,20): trade["State"]="NO ENTRY / EOD"
+            except Exception as e: trade["Last error"]=str(e)
+    st.session_state["institutional_paper_ledger"]=ledger
+    if ledger:
+        paper=pd.DataFrame(ledger.values())
+        st.dataframe(paper,use_container_width=True)
+        st.download_button("Export paper outcomes",paper.to_csv(index=False),"institutional_paper_outcomes.csv")
+    st.caption("Manual quote observations only; no orders, no assumed fills between checks, no permanent storage. Missed intraday touches remain unknown.")
