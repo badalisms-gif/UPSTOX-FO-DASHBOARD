@@ -10,6 +10,15 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     try:
         cfg=st.secrets["institutional_db"]
         if cfg.get("enabled",False):
+            import hmac
+            password=str(cfg.get("operator_password",""))
+            if len(password)<16:
+                st.error("Database access disabled: configure a strong operator password.")
+                return
+            entered=st.text_input("Research database operator password",type="password",key="institutional_operator_password")
+            if not hmac.compare_digest(entered.encode(),password.encode()):
+                st.info("Operator authentication required for research database access.")
+                return
             db=Storage(cfg["url"],cfg["key"])
     except Exception:
         pass
