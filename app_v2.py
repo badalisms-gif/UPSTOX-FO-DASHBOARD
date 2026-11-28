@@ -3108,7 +3108,7 @@ if page == "Trading Journal":
 # =====================================
 
 if page == "Institutional Intelligence":
-    render_institutional(token, instrument_mapping, technical, automatic_news)
+    render_institutional(token, instrument_mapping, technical, automatic_news, expiry, chain, now, minvol, spread, iv)
 
 st.divider()
 
