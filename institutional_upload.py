@@ -128,9 +128,25 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
             except Exception as e: results.append({"Symbol":sym,"Status":"UNVERIFIED","Reason":str(e)})
         out=pd.DataFrame(results)
         st.session_state["institutional_last_results"]=out
+        observed=out.copy()
+        observed["Observed at"]=now().isoformat()
+        observed["Watchlist size"]=len(table)
+        history=st.session_state.get("institutional_observations",[])
+        history.append(observed)
+        st.session_state["institutional_observations"]=history
         st.dataframe(out,use_container_width=True)
         for side in ("CE","PE"):
             st.subheader("Top "+side+" watchlist")
             if "Score" in out and "Side" in out:
                 st.dataframe(out[(out.Side==side)&out.Score.gt(0)].sort_values("Score",ascending=False),use_container_width=True)
         st.caption("Heuristic watch score, not probability. V7 risk and quote checks applied where available. Futures OI confirmation required for qualified research; missing data blocks qualification.")
+
+    history=st.session_state.get("institutional_observations",[])
+    if history:
+        st.subheader("Forward observation funnel (latest scan)")
+        latest=history[-1]
+        status=latest.Status.fillna("")
+        st.write({"Watchlist":int(latest["Watchlist size"].iloc[0]),"Scanned":len(latest),"Option watch or higher":int(status.str.contains("WATCH|QUALIFIED").sum()),"Qualified research":int(status.eq("QUALIFIED RESEARCH").sum())})
+        st.dataframe(latest,use_container_width=True)
+        st.download_button("Export timestamped forward observations",pd.concat(history,ignore_index=True).to_csv(index=False),"institutional_forward_observations.csv")
+        st.caption("Manual scans only. Counts are observations, not completed trade outcomes. Export before closing session.")
