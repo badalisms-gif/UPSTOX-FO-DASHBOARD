@@ -14,3 +14,5 @@ jobs:
       - run: python -m py_compile app_v2.py institutional_upload.py
       - run: pip install pandas numpy streamlit
       - run: python -c "from institutional_upload import render; assert callable(render)"
+
+      - run: python -m unittest -v test_institutional
