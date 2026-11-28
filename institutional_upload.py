@@ -80,6 +80,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Automatic permanent storage is not implemented. Futures confirmation requires fresh quotes and previous OI.")
     selected=st.multiselect("Stocks for live technical and news checks",table.Symbol.tolist(),default=table.Symbol.head(3).tolist(),max_selections=10)
     if st.button("Check technical and news"):
+        if not selected: st.info("Select at least one stock"); return
         if not token: st.error("Upstox token required"); return
         results=[]
         for sym in selected:
@@ -93,11 +94,11 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
                 if total and passed==total and not n.get("block") and n.get("complete"):
                     exp=expiry(token,mapping[sym],now().date())
                     if exp:
-                        c=chain(token,mapping[sym],exp)
+                        full_chain=chain(token,mapping[sym],exp)
+                        c=full_chain.copy()
                         if not c.empty:
                             c=c[(c.Side==side)&c.Delta.abs().between(.35,.75)&c.Volume.ge(minvol)&c["Spread %"].le(spread)&c.IV.gt(0)&c.IV.le(iv)&((c.Delta>0) if side=="CE" else (c.Delta<0))&c.Bid.gt(0)&c.Ask.ge(c.Bid)&c.OI.gt(0)].copy()
                             if not c.empty:
-                                full_chain=chain(token,mapping[sym],exp)
                                 c["Distance"]=(c.Delta.abs()-.55).abs()
                                 o=c.sort_values(["Spread %","Distance","Volume"],ascending=[True,True,False]).iloc[0]
                                 row.update({"Status":"CE/PE WATCH","Score":round(80+10*(1-o["Spread %"]/spread)+10*(1-min(1,o.Distance/.4)),1),"Strike":o.Strike,"Expiry":exp,"Ask":o.Ask,"Delta":o.Delta,"Theta":o.Theta,"Gamma":o.Gamma,"Vega":o.Vega,"IV":o.IV,"OI":o.OI,"OI Change":o["Daily OI Change"],"Spread %":o["Spread %"]})
@@ -126,6 +127,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
                 results.append(row)
             except Exception as e: results.append({"Symbol":sym,"Status":"UNVERIFIED","Reason":str(e)})
         out=pd.DataFrame(results)
+        st.session_state["institutional_last_results"]=out
         st.dataframe(out,use_container_width=True)
         for side in ("CE","PE"):
             st.subheader("Top "+side+" watchlist")
