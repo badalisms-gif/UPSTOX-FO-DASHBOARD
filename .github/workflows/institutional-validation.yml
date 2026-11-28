@@ -1,0 +1,18 @@
+name: Institutional validation
+on:
+  push:
+    branches: [institutional-csv-v8]
+  pull_request:
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m py_compile app_v2.py institutional_upload.py
+      - run: pip install pandas numpy streamlit
+      - run: python -c "from institutional_upload import render; assert callable(render)"
+
+      - run: python -m unittest -v test_institutional
