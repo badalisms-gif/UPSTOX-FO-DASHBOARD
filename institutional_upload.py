@@ -6,6 +6,22 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     st.header("Institutional Intelligence")
     st.caption("Research watchlist only. Weekly short sales are not open short positions.")
     frames=[]
+    archive=st.file_uploader("Restore historical archive (optional)",type=["csv"],key="inst_archive")
+    if archive is not None:
+        try:
+            h=pd.read_csv(archive,dtype={"symbol":str,"client":str})
+            required={"date","symbol","quantity","kind","client","side","price","value_cr"}
+            if not required.issubset(h.columns): raise ValueError("Invalid archive schema")
+            h["date"]=pd.to_datetime(h.date,errors="coerce")
+            for col in ("quantity","price"): h[col]=pd.to_numeric(h[col],errors="coerce")
+            h["symbol"]=h.symbol.fillna("").str.strip().str.upper()
+            h["client"]=h.client.fillna("").str.strip()
+            h["side"]=h.side.fillna("").str.upper()
+            ok=h.date.notna() & h.date.le(pd.Timestamp.now(tz="Asia/Kolkata").tz_localize(None).normalize()) & h.symbol.ne("") & np.isfinite(h.quantity) & h.quantity.gt(0) & h.kind.isin(["Bulk","Block","Short"])
+            ok &= h.kind.eq("Short") | (h.side.isin(["BUY","SELL"]) & h.client.ne("") & np.isfinite(h.price) & h.price.gt(0))
+            h["value_cr"]=h.quantity*h.price/1e7
+            frames.append(h.loc[ok,list(required)].copy())
+        except Exception as e: st.error(f"Archive: {e}")
     for kind in ("Bulk","Block","Short"):
         f=st.file_uploader(kind+" Deals CSV" if kind!="Short" else "Weekly Short Selling CSV",type=["csv"],key="inst_"+kind)
         if f is None: continue
@@ -32,6 +48,12 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
         except Exception as e: st.error(f"{kind}: {e}")
     if not frames: return
     d=pd.concat(frames,ignore_index=True)
+    for col in ("client","side","price","value_cr"):
+        if col not in d: d[col]=np.nan
+    for col in ("client","side"): d[col]=d[col].fillna("").str.strip()
+    d=d.drop_duplicates(subset=["kind","date","symbol","client","side","quantity","price"])
+    st.download_button("Save updated historical archive",d.to_csv(index=False,date_format="%Y-%m-%d"),"institutional_history.csv")
+    st.caption("Download and restore this archive on your next visit. Streamlit session is not permanent storage.")
     try: mapping=universe()
     except Exception as e:
         st.error(f"F&O universe unavailable: {e}"); return
