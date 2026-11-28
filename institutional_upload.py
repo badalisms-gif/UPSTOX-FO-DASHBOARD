@@ -5,7 +5,29 @@ import numpy as np
 def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv, option_setup, snapshots, futures):
     st.header("Institutional Intelligence")
     st.caption("Research watchlist only. Weekly short sales are not open short positions.")
+    from institutional_storage import Storage, records
+    db=None
+    try:
+        cfg=st.secrets["institutional_db"]
+        if cfg.get("enabled",False):
+            db=Storage(cfg["url"],cfg["key"])
+    except Exception:
+        pass
+    def save(table,frame,keys):
+        if db is not None:
+            try: db.save(table,records(frame,keys))
+            except Exception: st.error("Database save failed: "+table)
     frames=[]
+    if db is not None and st.checkbox("Restore database history",value=True):
+        try:
+            stored=db.load("institutional_history")
+            if stored:
+                restored=pd.DataFrame([r["payload"] for r in stored])
+                restored["date"]=pd.to_datetime(restored.date,errors="coerce")
+                frames.append(restored)
+            if "institutional_paper_ledger" not in st.session_state:
+                st.session_state["institutional_paper_ledger"]={r["payload"]["Signal time"][:10]+"|"+r["payload"]["Option key"]:r["payload"] for r in db.load("institutional_paper_results")}
+        except Exception: st.error("Database restore failed")
     archive=st.file_uploader("Restore historical archive (optional)",type=["csv"],key="inst_archive")
     if archive is not None:
         try:
@@ -52,6 +74,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
         if col not in d: d[col]=np.nan
     for col in ("client","side"): d[col]=d[col].fillna("").str.strip()
     d=d.drop_duplicates(subset=["kind","date","symbol","client","side","quantity","price"])
+    save("institutional_history",d,["kind","date","symbol","client","side","quantity","price"])
     st.download_button("Save updated historical archive",d.to_csv(index=False,date_format="%Y-%m-%d"),"institutional_history.csv")
     st.caption("Download and restore this archive on your next visit. Streamlit session is not permanent storage.")
     try: mapping=universe()
@@ -75,6 +98,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
         if row["Activity Cr"] or row["Short qty"]: rows.append(row)
     if not rows: st.info("No disclosures in selected window"); return
     table=pd.DataFrame(rows).sort_values(["Activity Cr","Short qty"],ascending=False)
+    save("institutional_watchlist",table.assign(Analysis_date=str(day.date())),["Analysis_date","Symbol"])
     st.dataframe(table,use_container_width=True)
     st.download_button("Export disclosure shortlist",table.to_csv(index=False),"institutional_shortlist.csv")
     st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Automatic permanent storage is not implemented. Futures confirmation requires fresh quotes and previous OI.")
@@ -145,6 +169,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
             observed["Observed at"]=now().isoformat()
             observed["Watchlist size"]=len(table)
             history=st.session_state.get("institutional_observations",[])
+            save("institutional_observations",observed,["Observed at","Symbol"])
             history.append(observed)
             st.session_state["institutional_observations"]=history
             st.dataframe(out,use_container_width=True)
@@ -200,6 +225,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
         st.session_state["institutional_paper_ledger"]=ledger
         if ledger:
             paper=pd.DataFrame(ledger.values())
+            save("institutional_paper_results",paper,["Signal time","Option key"])
             st.dataframe(paper,use_container_width=True)
             st.download_button("Export paper outcomes",paper.to_csv(index=False),"institutional_paper_outcomes.csv")
         st.caption("Periodic quote observations only; no orders, no assumed fills between checks, no permanent storage. Missed intraday touches remain unknown.")
