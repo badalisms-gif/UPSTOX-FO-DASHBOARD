@@ -17,6 +17,7 @@ class UI:
     def download_button(self,label,data,*args,**kw): self.exports.append((label,data))
     def error(self,msg): self.errors.append(msg)
     def multiselect(self,*args,**kw): return []
+    def fragment(self,**kw): return lambda fn: fn
     def button(self,*args,**kw): return False
     def __getattr__(self,name): return lambda *args,**kw: None
 
@@ -24,7 +25,7 @@ class TestUpload(unittest.TestCase):
     def test_three_reports(self):
         ui=UI()
         with patch.object(mod,"st",ui):
-            mod.render("",lambda:{"ABC":"key"},None,None,None,None,None,1,2,50,None,{},None)
+            mod.render("",lambda:{"ABC":"key"},None,None,None,None,lambda:pd.Timestamp("2026-11-28 10:00",tz="Asia/Kolkata"),1,2,50,None,{},None)
         self.assertEqual(ui.errors,[])
         self.assertEqual(len(ui.tables),1)
         d=ui.tables[0]
