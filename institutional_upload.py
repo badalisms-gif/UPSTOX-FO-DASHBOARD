@@ -112,7 +112,13 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     if not rows: st.info("No disclosures in selected window"); return
     table=pd.DataFrame(rows).sort_values(["Activity Cr","Short qty"],ascending=False)
     save("institutional_watchlist",table.assign(Analysis_date=str(day.date())),["Analysis_date","Symbol"])
-    st.dataframe(table,use_container_width=True)
+    view=st.selectbox("Watchlist category",["Combined","Bulk Deals","Block Deals","Short Selling"])
+    shown=table
+    if view=="Bulk Deals": shown=table[table["Bulk BUY Cr"]+table["Bulk SELL Cr"]>0].sort_values("Bulk BUY Cr",ascending=False)
+    elif view=="Block Deals": shown=table[table["Block BUY Cr"]+table["Block SELL Cr"]>0].sort_values("Block BUY Cr",ascending=False)
+    elif view=="Short Selling": shown=table[table["Short qty"]>0].sort_values("Short qty",ascending=False)
+    st.write("Stocks in selected category:",len(shown))
+    st.dataframe(shown.reset_index(drop=True),use_container_width=True)
     st.download_button("Export disclosure shortlist",table.to_csv(index=False),"institutional_shortlist.csv")
     st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Automatic permanent storage is not implemented. Futures confirmation requires fresh quotes and previous OI.")
     auto=st.checkbox("Auto scan every 5 minutes (keep dashboard open)",key="inst_auto")
