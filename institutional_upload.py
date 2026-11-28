@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 import numpy as np
 
-def render(token, universe, technical, news):
+def render(token, universe, technical, news, expiry, chain, now, minvol, spread, iv):
     st.header("Institutional Intelligence")
     st.caption("Research watchlist only. Weekly short sales are not open short positions.")
     frames=[]
@@ -55,7 +55,7 @@ def render(token, universe, technical, news):
     table=pd.DataFrame(rows).sort_values(["Activity Cr","Short qty"],ascending=False)
     st.dataframe(table,use_container_width=True)
     st.download_button("Export disclosure shortlist",table.to_csv(index=False),"institutional_shortlist.csv")
-    st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Historical storage, futures OI and option confirmation are not yet implemented.")
+    st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Historical storage and futures OI are not yet implemented.")
     selected=st.multiselect("Stocks for live technical and news checks",table.Symbol.tolist(),default=table.Symbol.head(3).tolist(),max_selections=10)
     if st.button("Check technical and news"):
         if not token: st.error("Upstox token required"); return
@@ -67,6 +67,23 @@ def render(token, universe, technical, news):
                 n=news(sym,side)
                 passed=sum(bool(v) for v in checks.values() if v is not None)
                 total=sum(v is not None for v in checks.values())
-                results.append({"Symbol":sym,"Side":side,"Technical checks":f"{passed}/{total}","News":n.get("status","UNKNOWN"),"Status":"WATCH ONLY" if passed==total and not n.get("block") and n.get("complete") else "NO TRADE"})
+                row={"Symbol":sym,"Side":side,"Technical checks":f"{passed}/{total}","News":n.get("status","UNKNOWN"),"Status":"NO TRADE","Score":0}
+                if total and passed==total and not n.get("block") and n.get("complete"):
+                    exp=expiry(token,mapping[sym],now().date())
+                    if exp:
+                        c=chain(token,mapping[sym],exp)
+                        if not c.empty:
+                            c=c[(c.Side==side)&c.Delta.abs().between(.35,.75)&c.Volume.ge(minvol)&c["Spread %"].le(spread)&c.IV.between(0,iv)&c.Bid.gt(0)&c.Ask.ge(c.Bid)&c.OI.gt(0)].copy()
+                            if not c.empty:
+                                c["Distance"]=(c.Delta.abs()-.55).abs()
+                                o=c.sort_values(["Spread %","Distance","Volume"],ascending=[True,True,False]).iloc[0]
+                                row.update({"Status":"CE/PE WATCH","Score":round(80+10*(1-o["Spread %"]/spread)+10*(1-min(1,o.Distance/.4)),1),"Strike":o.Strike,"Expiry":exp,"Ask":o.Ask,"Delta":o.Delta,"Theta":o.Theta,"Gamma":o.Gamma,"Vega":o.Vega,"IV":o.IV,"OI":o.OI,"OI Change":o["Daily OI Change"],"Spread %":o["Spread %"]})
+                results.append(row)
             except Exception as e: results.append({"Symbol":sym,"Status":"UNVERIFIED","Reason":str(e)})
-        st.dataframe(pd.DataFrame(results),use_container_width=True)
+        out=pd.DataFrame(results)
+        st.dataframe(out,use_container_width=True)
+        for side in ("CE","PE"):
+            st.subheader("Top "+side+" watchlist")
+            if "Score" in out and "Side" in out:
+                st.dataframe(out[(out.Side==side)&out.Score.gt(0)].sort_values("Score",ascending=False),use_container_width=True)
+        st.caption("Heuristic watch score, not probability. No entry signal; futures OI and fresh option quote verification pending.")
