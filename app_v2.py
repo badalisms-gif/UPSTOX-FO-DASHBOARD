@@ -12,6 +12,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from institutional_upload import render as render_institutional
 from news_engine import assess_news, scan_news_market
 from backtest_engine import render_backtesting
 from backtest_engine_v7 import render_backtesting_v7
@@ -962,7 +963,8 @@ with st.sidebar:
             "News & Events",
             "Signal History",
             "Backtesting",
-            "Trading Journal"
+            "Trading Journal",
+            "Institutional Intelligence"
         ]
     )
 
@@ -3104,6 +3106,9 @@ if page == "Trading Journal":
 # =====================================
 # V7 DASHBOARD FOOTER
 # =====================================
+
+if page == "Institutional Intelligence":
+    render_institutional(token, instrument_mapping, technical, automatic_news)
 
 st.divider()
 
