@@ -7,7 +7,9 @@ TABLES={"institutional_history","institutional_watchlist","institutional_observa
 class Storage:
     def __init__(self,url,key):
         self.url=url.rstrip("/")+"/rest/v1/"
-        self.headers={"apikey":key,"Authorization":"Bearer "+key}
+        self.headers={"apikey":key}
+        if not key.startswith("sb_secret_"):
+            self.headers["Authorization"]="Bearer "+key
     def save(self,table,records):
         if table not in TABLES: raise ValueError("Unknown table")
         for i in range(0,len(records),100):
