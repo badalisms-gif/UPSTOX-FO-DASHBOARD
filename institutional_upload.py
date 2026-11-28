@@ -80,16 +80,23 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Automatic permanent storage is not implemented. Futures confirmation requires fresh quotes and previous OI.")
     auto=st.checkbox("Auto scan every 5 minutes (keep dashboard open)",key="inst_auto")
     selected=st.multiselect("Stocks for live technical and news checks",table.Symbol.tolist(),default=table.Symbol.head(3).tolist(),max_selections=10)
+    full=st.checkbox("Rotate through entire watchlist automatically",key="inst_full")
     @st.fragment(run_every="300s" if auto else None)
     def monitor():
         t=now()
         active=t.weekday()<5 and (9,15)<=(t.hour,t.minute)<(15,30)
         manual=st.button("Check technical and news")
+        batch=selected
+        if auto and active and full and not manual:
+            symbols=table.Symbol.tolist()
+            cursor=st.session_state.get("inst_cursor",0)%len(symbols)
+            batch=symbols[cursor:cursor+10]
+            st.session_state["inst_cursor"]=(cursor+len(batch))%len(symbols)
         if manual or (auto and active):
-            if not selected: st.info("Select at least one stock"); return
+            if not batch: st.info("Select at least one stock"); return
             if not token: st.error("Upstox token required"); return
             results=[]
-            for sym in selected:
+            for sym in batch:
                 try:
                     side,checks,metrics=technical(token,mapping[sym])
                     if side not in ("CE","PE"): results.append({"Symbol":sym,"Status":"NO TRADE"}); continue
