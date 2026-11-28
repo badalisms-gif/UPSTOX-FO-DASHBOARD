@@ -93,6 +93,9 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     try: mapping=universe()
     except Exception as e:
         st.error(f"F&O universe unavailable: {e}"); return
+    excluded=d[~d.symbol.isin(mapping)]
+    with st.expander("Disclosure stocks excluded by F&O filter"):
+        st.dataframe(excluded.groupby("kind")["symbol"].unique().apply(lambda x:", ".join(sorted(x))).reset_index(),use_container_width=True)
     d=d[d.symbol.isin(mapping)]
     if d.empty: st.info("No matching F&O disclosures"); return
     asof=st.date_input("Analysis date",value=d.date.max().date())
@@ -118,6 +121,7 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
     elif view=="Block Deals": shown=table[table["Block BUY Cr"]+table["Block SELL Cr"]>0].sort_values("Block BUY Cr",ascending=False)
     elif view=="Short Selling": shown=table[table["Short qty"]>0].sort_values("Short qty",ascending=False)
     st.write("Stocks in selected category:",len(shown))
+    if shown.empty: st.info("No matching F&O disclosures in this category for the selected date.")
     st.dataframe(shown.reset_index(drop=True),use_container_width=True)
     st.download_button("Export disclosure shortlist",table.to_csv(index=False),"institutional_shortlist.csv")
     st.warning("Deal totals may include both counterparties or overlapping reports. Activity is not directional evidence. Automatic permanent storage is not implemented. Futures confirmation requires fresh quotes and previous OI.")
