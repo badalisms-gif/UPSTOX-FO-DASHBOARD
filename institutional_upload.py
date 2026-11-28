@@ -55,6 +55,10 @@ def render(token, universe, technical, news, expiry, chain, now, minvol, spread,
         except Exception as e: st.error(f"Archive: {e}")
     for kind in ("Bulk","Block","Short"):
         f=st.file_uploader(kind+" Deals CSV" if kind!="Short" else "Weekly Short Selling CSV",type=["csv"],key="inst_"+kind)
+        pasted=st.text_area("Paste "+kind+" CSV data (alternative to upload)",key="inst_paste_"+kind,height=90)
+        if pasted.strip():
+            import io
+            f=io.BytesIO(pasted.strip().encode("utf-8"))
         if f is None: continue
         try:
             d=pd.read_csv(f,encoding="utf-8-sig",dtype=str).fillna("")
