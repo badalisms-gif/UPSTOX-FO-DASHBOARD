@@ -929,6 +929,9 @@ with st.sidebar:
         1, 20, 5
     )
 
+    st.header("Master Auto Scanner")
+    master_auto = st.toggle("START MASTER AUTO SCANNER",value=False)
+    st.caption("Keep Home open and authenticate Institutional Intelligence below. Research only.")
     st.header("Advanced News Engine")
 
     news_batch = st.slider(
@@ -951,6 +954,8 @@ with st.sidebar:
         value=True
     )
 
+    auto = auto or master_auto
+    news_auto = news_auto or master_auto
     st.header("Navigation")
 
     page = st.radio(
@@ -3131,8 +3136,10 @@ def institutional_futures(token, key, side):
     return {"Futures contract":k,"Futures price change %":round(pc,2),"Futures OI change %":round(oc,2),"Futures buildup":label,"Futures confirmed":bool(oc!=0 and ((pc>0 and side=="CE") or (pc<0 and side=="PE")))}
 
 
-if page == "Institutional Intelligence":
-    render_institutional(token, instrument_mapping, technical, automatic_news, expiry, chain, now, minvol, spread, iv, option_setup, S.snapshots, institutional_futures, ranking)
+if page == "Institutional Intelligence" or (page == "Home" and master_auto):
+    if page == "Home":
+        st.header("Master scanner — institutional research")
+    render_institutional(token, instrument_mapping, technical, automatic_news, expiry, chain, now, minvol, spread, iv, option_setup, S.snapshots, institutional_futures, ranking, master_auto)
 
 st.divider()
 
