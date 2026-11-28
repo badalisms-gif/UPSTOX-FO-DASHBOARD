@@ -2347,6 +2347,40 @@ def show_forward_observations():
 # MAIN DASHBOARD
 # =====================================
 
+def show_common_watchlist(opened):
+    st.header("Common Stock Watchlist")
+    if not opened:
+        st.info("Market closed / unverified — no live common watch.")
+        return
+    votes={}
+    def add(symbol,side,engine):
+        if symbol and side in ("CE","PE"):
+            votes.setdefault(symbol,{}).setdefault(side,set()).add(engine)
+    if S.last_scan and recent(str(S.last_scan),180) and not S.ranking.empty:
+        for r in S.ranking.to_dict("records"):
+            if r.get("Fresh"): add(r.get("Symbol"),r.get("Side"),"Market")
+    for symbol,r in S.news_market.items():
+        if recent(r.get("Checked"),300) and news_feed_ok({"symbol":symbol,"sources":r.get("Sources",{})}):
+            direction=r.get("News Direction")
+            if direction in ("CE WATCH","PE WATCH"): add(symbol,direction.split()[0],"News")
+    history=st.session_state.get("institutional_observations",[])
+    if history:
+        latest=pd.concat(history,ignore_index=True).drop_duplicates("Symbol",keep="last")
+        for r in latest.to_dict("records"):
+            if recent(r.get("Observed at"),300) and r.get("Status") in ("CE/PE WATCH","QUALIFIED RESEARCH","WATCH ONLY / Futures unverified"):
+                add(r.get("Symbol"),r.get("Side"),"Institutional")
+    rows=[]
+    for symbol,sides in votes.items():
+        if len(sides)!=1: continue
+        side,engines=next(iter(sides.items()))
+        if len(engines)>=2: rows.append({"Stock":symbol,"Watch":side+" WATCH","count":len(engines)})
+    if rows:
+        frame=pd.DataFrame(rows).sort_values(["count","Stock"],ascending=[False,True])
+        st.dataframe(frame[["Stock","Watch"]],hide_index=True,use_container_width=True)
+    else: st.info("No matching fresh directional watches from two engines.")
+    st.caption("Research watch only; engines share some inputs. Not a buy signal.")
+
+
 @st.fragment(
     run_every="120s"
     if auto or news_auto
@@ -2364,6 +2398,8 @@ def dashboard():
         token and open_market(token)
     )
 
+    if page == "Home":
+        show_common_watchlist(opened)
     st.caption("Active Mode: " + mode)
 
     a, b, c = st.columns(3)
