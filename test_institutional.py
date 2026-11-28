@@ -5,7 +5,7 @@ import pandas as pd
 import institutional_upload as mod
 
 class UI:
-    def __init__(self): self.tables=[]; self.errors=[]; self.exports=[]
+    def __init__(self): self.tables=[]; self.errors=[]; self.exports=[]; self.session_state={}
     def file_uploader(self,*args,**kw):
         data={
           "inst_Bulk":"Date,Symbol,Client Name,Buy / Sell,Quantity Traded,Trade Price / Wght. Avg. Price\n27-Nov-26,ABC,CLIENT,BUY,100,200\n27-Nov-26,ABC,CLIENT,BUY,100,200\n27-Nov-26,XYZ,CLIENT,BUY,100,200\n",
